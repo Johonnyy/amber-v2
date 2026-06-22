@@ -20,6 +20,12 @@ Phase 5 extends two frames *additively* (old clients ignore the new fields, so t
 contract stays compatible): ``ready`` now carries a ``session_id`` the client
 echoes back as ``?session_id=`` to resume after a reconnect, and ``error`` may
 carry a machine-readable ``code`` (see the ``ERR_*`` constants).
+
+Memory surfacing (Phase 3) adds one more *additive* server -> client frame,
+``memory``: the facts Amber is currently drawing on for this turn. It's advisory —
+clients render it (e.g. a memory panel) but it never affects the voice loop — so a
+client that ignores it behaves exactly as before. Sent at most once per turn,
+before the reply streams.
 """
 
 from __future__ import annotations
@@ -35,6 +41,7 @@ TRANSCRIPT = "transcript"  # what STT heard from the user
 THINKING = "thinking"  # Amber is generating a response
 AUDIO_CHUNK = "audio_chunk"  # metadata; the NEXT binary frame is this sentence
 TURN_COMPLETE = "turn_complete"  # the full response has been sent
+MEMORY = "memory"  # what Amber currently remembers about the user (advisory)
 ERROR = "error"  # something went wrong this turn
 
 # --- error codes (the optional ``code`` field on an error frame) ---
@@ -84,6 +91,16 @@ def audio_chunk(index: int, text: str, audio_format: str) -> dict[str, Any]:
 
 def turn_complete(sentences: int) -> dict[str, Any]:
     return {"type": TURN_COMPLETE, "sentences": sentences}
+
+
+def memory(items: list[str]) -> dict[str, Any]:
+    """The facts Amber is drawing on this turn, surfaced for the client to display.
+
+    Advisory only: a client renders ``items`` (e.g. a memory panel) but the frame
+    never affects the voice loop, so clients that ignore it are unaffected. ``items``
+    is the same ranked set of distilled facts injected into the LLM's system prompt.
+    """
+    return {"type": MEMORY, "items": list(items)}
 
 
 def error(message: str, code: str | None = None) -> dict[str, Any]:

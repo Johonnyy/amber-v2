@@ -32,7 +32,7 @@ from collections.abc import AsyncIterator, Awaitable, Callable
 from app import protocol
 from app.brain import think
 from app.config import get_settings
-from app.memory import build_context, remember
+from app.memory import build_memory_view, remember
 from app.persona import compose_system_prompt
 from app.responder import respond
 from app.sentence_splitter import SentenceSplitter
@@ -127,8 +127,13 @@ async def _think_and_speak(
     # Phase 2: the brain. Fallback to the Phase-1 canned reply when the LLM is off
     # (no key / tests / demos) so the pipe still runs end to end.
     if settings.feature_llm:
-        # Phase 3 read half: pull relevant long-term memory into the system prompt.
-        memory_block = await build_context(transcript_text)
+        # Phase 3 read half: pull relevant long-term memory once — into the system
+        # prompt (the model's copy) and out to the client as a ``memory`` frame (the
+        # user-visible copy), so the two can't drift. The frame is advisory; emitting
+        # it before the reply streams lets a client show what Amber is drawing on.
+        memory_block, memory_items = await build_memory_view(transcript_text)
+        if memory_items:
+            await send_json(protocol.memory(memory_items))
         system = compose_system_prompt(memory_block)
         tokens = think(conversation.messages, system=system)
     else:

@@ -38,9 +38,10 @@ def fake_io(monkeypatch):
 async def test_memory_block_reaches_the_brain_system_prompt(fake_io, monkeypatch):
     seen = {}
 
-    async def fake_build_context(query=None, **kw):
+    async def fake_build_memory_view(query=None, **kw):
         seen["query"] = query
-        return "What you remember about your user:\n- Has a dog named Mango"
+        block = "What you remember about your user:\n- Has a dog named Mango"
+        return block, ["Has a dog named Mango"]
 
     async def fake_think(messages, system=None):
         seen["system"] = system
@@ -49,7 +50,7 @@ async def test_memory_block_reaches_the_brain_system_prompt(fake_io, monkeypatch
     async def no_remember(user_text, reply, **kw):
         return []
 
-    monkeypatch.setattr(pipeline, "build_context", fake_build_context)
+    monkeypatch.setattr(pipeline, "build_memory_view", fake_build_memory_view)
     monkeypatch.setattr(pipeline, "think", fake_think)
     monkeypatch.setattr(pipeline, "remember", no_remember)
 
@@ -61,13 +62,16 @@ async def test_memory_block_reaches_the_brain_system_prompt(fake_io, monkeypatch
     # The memory block was appended to the persona prompt handed to the brain.
     assert "Has a dog named Mango" in seen["system"]
     assert "You are Amber" in seen["system"]  # persona still present
+    # And the same facts were surfaced to the client as a memory frame.
+    mem = [m for m in sink.json if m["type"] == "memory"]
+    assert mem == [{"type": "memory", "items": ["Has a dog named Mango"]}]
 
 
 async def test_writer_called_with_exchange_after_turn(fake_io, monkeypatch):
     calls = []
 
     async def no_context(query=None, **kw):
-        return None
+        return None, []
 
     async def fake_think(messages, system=None):
         yield "Nice, Mango sounds lovely."
@@ -76,7 +80,7 @@ async def test_writer_called_with_exchange_after_turn(fake_io, monkeypatch):
         calls.append((user_text, reply))
         return ["Has a dog named Mango"]
 
-    monkeypatch.setattr(pipeline, "build_context", no_context)
+    monkeypatch.setattr(pipeline, "build_memory_view", no_context)
     monkeypatch.setattr(pipeline, "think", fake_think)
     monkeypatch.setattr(pipeline, "remember", spy_remember)
 
@@ -88,7 +92,7 @@ async def test_writer_called_with_exchange_after_turn(fake_io, monkeypatch):
 
 async def test_writer_failure_does_not_break_the_turn(fake_io, monkeypatch):
     async def no_context(query=None, **kw):
-        return None
+        return None, []
 
     async def fake_think(messages, system=None):
         yield "All good."
@@ -96,7 +100,7 @@ async def test_writer_failure_does_not_break_the_turn(fake_io, monkeypatch):
     async def boom_remember(user_text, reply, **kw):
         raise RuntimeError("extraction exploded")
 
-    monkeypatch.setattr(pipeline, "build_context", no_context)
+    monkeypatch.setattr(pipeline, "build_memory_view", no_context)
     monkeypatch.setattr(pipeline, "think", fake_think)
     monkeypatch.setattr(pipeline, "remember", boom_remember)
 

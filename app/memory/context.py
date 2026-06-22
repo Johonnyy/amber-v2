@@ -82,6 +82,37 @@ def _format_block(facts: list[dict], tasks: list[dict]) -> str | None:
     return "\n".join(lines)
 
 
+async def build_memory_view(
+    query: str | None = None,
+    *,
+    store: MemoryStore | None = None,
+    settings: Settings | None = None,
+) -> tuple[str | None, list[str]]:
+    """Build both halves of the per-turn memory read in one store pass.
+
+    Returns ``(block, items)``:
+
+    * ``block`` — the compressed text injected into the LLM's system prompt (or
+      ``None`` when there's nothing to inject), exactly as before.
+    * ``items`` — the same ranked facts as a flat list of strings, for surfacing to
+      the client over the ``memory`` protocol frame (empty when there are none).
+
+    Both come from a single read so the facts the user *sees* and the facts the model
+    *gets* can never drift apart. Returns ``(None, [])`` when memory is disabled.
+    """
+    settings = settings or get_settings()
+    if not settings.feature_memory:
+        return None, []
+    store = store or get_store()
+
+    facts = await asyncio.to_thread(store.all_facts)
+    tasks = await asyncio.to_thread(store.open_tasks)
+    ranked = _rank_facts(facts, query, settings.memory_max_facts)
+    block = _format_block(ranked, tasks)
+    items = [f["content"] for f in ranked]
+    return block, items
+
+
 async def build_context(
     query: str | None = None,
     *,
@@ -92,14 +123,8 @@ async def build_context(
 
     ``query`` is the incoming user message, used to rank facts by relevance.
     Returns ``None`` when memory is off or there's nothing to inject, so the caller
-    can fall back to the bare persona prompt.
+    can fall back to the bare persona prompt. Thin wrapper over
+    ``build_memory_view`` for callers that only need the prompt block.
     """
-    settings = settings or get_settings()
-    if not settings.feature_memory:
-        return None
-    store = store or get_store()
-
-    facts = await asyncio.to_thread(store.all_facts)
-    tasks = await asyncio.to_thread(store.open_tasks)
-    ranked = _rank_facts(facts, query, settings.memory_max_facts)
-    return _format_block(ranked, tasks)
+    block, _ = await build_memory_view(query, store=store, settings=settings)
+    return block

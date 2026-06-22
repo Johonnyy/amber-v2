@@ -34,7 +34,7 @@ def fake_io(monkeypatch):
         return f"AUDIO[{text}]".encode()
 
     async def no_context(query=None, **kw):
-        return None
+        return None, []
 
     async def no_remember(user_text, reply, **kw):
         return []
@@ -43,7 +43,7 @@ def fake_io(monkeypatch):
     monkeypatch.setattr(pipeline, "synthesize", fake_synthesize)
     # Memory defaults on; keep these pipeline tests focused (and offline) by
     # stubbing the read/write halves. Memory has its own dedicated tests.
-    monkeypatch.setattr(pipeline, "build_context", no_context)
+    monkeypatch.setattr(pipeline, "build_memory_view", no_context)
     monkeypatch.setattr(pipeline, "remember", no_remember)
 
 

@@ -18,7 +18,7 @@ half) and `build_context` (read half) — plus `get_store` for direct access.
 
 from __future__ import annotations
 
-from app.memory.context import build_context
+from app.memory.context import build_context, build_memory_view
 from app.memory.store import MemoryStore, get_store
 from app.memory.writer import extract_facts, remember
 
@@ -28,4 +28,5 @@ __all__ = [
     "remember",
     "extract_facts",
     "build_context",
+    "build_memory_view",
 ]

@@ -28,7 +28,7 @@ def faked_io(monkeypatch):
             yield chunk
 
     async def no_context(query=None, **kw):
-        return None
+        return None, []
 
     async def no_remember(user_text, reply, **kw):
         return []
@@ -36,7 +36,7 @@ def faked_io(monkeypatch):
     monkeypatch.setattr(pipeline, "transcribe", fake_transcribe)
     monkeypatch.setattr(pipeline, "synthesize", fake_synthesize)
     monkeypatch.setattr(pipeline, "think", fake_think)
-    monkeypatch.setattr(pipeline, "build_context", no_context)
+    monkeypatch.setattr(pipeline, "build_memory_view", no_context)
     monkeypatch.setattr(pipeline, "remember", no_remember)
 
 

@@ -110,10 +110,14 @@ downstream of the brain is unchanged.
 Persistent memory (Phase 3) lives in the `app/memory/` package: `store.py` (SQLite
 `facts`/`conversations`/`tasks`/`reminders` tables + sync CRUD, `get_store()`),
 `writer.py` (`remember` — distil facts from an exchange via a cheap LLM call, after
-the turn is spoken), and `context.py` (`build_context` — rank relevant facts into a
-compressed prompt block before each turn). Gated by `AMBER_FEATURE_MEMORY`; the
-read half runs inline before the brain, the write half runs off the latency path
-after `turn_complete`. Memory is *persistent cross-session knowledge*, distinct
+the turn is spoken), and `context.py` (`build_memory_view` — rank relevant facts in
+one store pass into both a compressed prompt *block* for the system prompt and a
+flat list of *items* for client display; `build_context` is the block-only
+wrapper). Gated by `AMBER_FEATURE_MEMORY`; the read half runs inline before the
+brain — injecting the block into the prompt *and* emitting an additive `memory`
+protocol frame (the same facts, advisory, for the client's memory panel) — and the
+write half runs off the latency path after `turn_complete`. Memory is *persistent
+cross-session knowledge*, distinct
 from the in-memory per-connection history in `app/session.py` — don't conflate them.
 
 Tools (Phase 4) live in the `app/tools/` package, gated by `AMBER_FEATURE_TOOLS`.
