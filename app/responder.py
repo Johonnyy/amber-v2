@@ -1,10 +1,11 @@
-"""Phase 1 stand-in for the brain.
+"""Canned fallback brain — used when the LLM is disabled.
 
-There is no LLM yet (that's Phase 2). To prove the pipe end to end — and to exercise
-the streaming sentence splitter the way a real token stream will — this yields a
-short, multi-sentence reply as a sequence of small text chunks, mimicking an LLM
-token stream. Phase 2 replaces this generator with the actual Claude stream; the
-pipeline downstream of it does not change.
+Phase 2 added the real brain (`app.brain`, Claude). This module remains as the
+fallback the pipeline uses when ``AMBER_FEATURE_LLM=false`` (no Anthropic key, or
+tests/demos): it yields a short, multi-sentence reply as a sequence of small text
+chunks, mimicking a token stream, so the pipe still runs end to end and exercises
+the streaming sentence splitter. Same ``AsyncIterator[str]`` contract as
+`app.brain.think`.
 """
 
 from __future__ import annotations
@@ -19,12 +20,12 @@ def _greeting(transcript: str) -> str:
         return (
             f"Hello! I'm Amber, and the voice pipeline is working. "
             f"I heard you say: {heard}. "
-            f"Once my brain comes online in Phase 2, I'll actually respond."
+            f"My brain is switched off right now, so this is a canned reply."
         )
     return (
         "Hello! I'm Amber, and the voice pipeline is working. "
         "I didn't quite catch any words that time. "
-        "Try speaking again once my brain comes online in Phase 2."
+        "Try speaking again."
     )
 
 

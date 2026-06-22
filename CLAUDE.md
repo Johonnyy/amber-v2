@@ -100,6 +100,8 @@ unit is `deploy/amber.service`; runs `uvicorn app.main:app` under user `amber` f
 
 Key modules: `app/config.py` (all models/keys/flags), `app/protocol.py` (WS wire
 contract), `app/sentence_splitter.py` (streaming seam), `app/pipeline.py` (the voice
-loop), `app/main.py` (FastAPI + `/ws`). The Phase-1 "brain" is `app/responder.py` (a
-canned greeting) — swap it for the Claude stream in Phase 2; the pipeline downstream
-is unchanged.
+loop), `app/main.py` (FastAPI + `/ws`). The "brain" is `app/brain.py` (streamed
+Claude Haiku) with its personality in `app/persona.py`; `app/session.py` holds
+per-connection conversation history. `app/responder.py` is the canned fallback used
+when `AMBER_FEATURE_LLM=false`. Both speak the same `AsyncIterator[str]` contract,
+so the pipeline downstream of the brain is unchanged.

@@ -19,6 +19,7 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect, status
 from app import protocol
 from app.config import get_settings
 from app.pipeline import run_turn
+from app.session import Conversation
 
 settings = get_settings()
 logging.basicConfig(
@@ -56,6 +57,8 @@ async def voice_socket(websocket: WebSocket) -> None:
     async def send_bytes(data: bytes) -> None:
         await websocket.send_bytes(data)
 
+    # Conversation history for this connection only (Phase 2). Dies with the socket.
+    conversation = Conversation()
     current_turn: asyncio.Task | None = None
 
     async def cancel_current(reason: str) -> None:
@@ -81,7 +84,7 @@ async def voice_socket(websocket: WebSocket) -> None:
                 # New utterance. Barge-in: drop any in-flight turn first.
                 await cancel_current("barge-in")
                 current_turn = asyncio.create_task(
-                    _guarded_turn(data, send_json, send_bytes)
+                    _guarded_turn(data, send_json, send_bytes, conversation)
                 )
                 continue
 
@@ -112,10 +115,10 @@ async def _handle_control(text: str, cancel_current) -> None:
         logger.debug("Ignoring unknown control frame: %r", payload)
 
 
-async def _guarded_turn(audio: bytes, send_json, send_bytes) -> None:
+async def _guarded_turn(audio: bytes, send_json, send_bytes, conversation) -> None:
     """Run one turn, converting failures into an error frame instead of a crash."""
     try:
-        await run_turn(audio, send_json, send_bytes)
+        await run_turn(audio, send_json, send_bytes, conversation)
     except asyncio.CancelledError:
         raise  # interrupt/barge-in — expected, let it unwind
     except Exception as exc:  # noqa: BLE001 — surface any turn failure to the client

@@ -1,12 +1,13 @@
 [project]
 name = "amber"
 version = "0.1.0"
-description = "Amber — a cloud-hosted personal AI voice backend. Phase 1: skeleton & voice pipeline."
+description = "Amber — a cloud-hosted personal AI voice backend. Phase 2: LLM brain & conversation."
 requires-python = ">=3.11"
 dependencies = [
     "fastapi>=0.115",
     "uvicorn[standard]>=0.30",
     "openai>=1.40",
+    "anthropic>=0.49",
     "pydantic>=2.7",
     "pydantic-settings>=2.3",
     "python-dotenv>=1.0",

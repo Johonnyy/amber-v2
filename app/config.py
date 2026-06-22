@@ -29,6 +29,10 @@ class Settings(BaseSettings):
         default="",
         description="OpenAI API key used for both STT (Whisper) and TTS.",
     )
+    anthropic_api_key: str = Field(
+        default="",
+        description="Anthropic API key used for the LLM brain (Claude).",
+    )
 
     # --- Server ---
     host: str = "0.0.0.0"
@@ -40,11 +44,17 @@ class Settings(BaseSettings):
     tts_model: str = "tts-1"
     tts_voice: str = "alloy"
     tts_format: str = "mp3"
-    # The brain. Unused until Phase 2 but kept here so it's swappable from day one.
+    # The brain (Claude Haiku — fast, low-latency, good for a voice loop).
     llm_model: str = "claude-haiku-4-5-20251001"
+    # Cap on a single spoken reply. Voice answers are short; keep this modest so
+    # a runaway generation can't stream for minutes. Bump it for longer replies.
+    llm_max_tokens: int = 1024
 
     # --- Feature flags ---
     feature_stt: bool = True
+    # When false, the LLM brain is bypassed and the Phase-1 canned greeting is
+    # returned instead. Lets the pipe run without an Anthropic key (tests, demos).
+    feature_llm: bool = True
 
     # --- Auth (Phase 5; disabled when empty) ---
     auth_secret: str = ""
