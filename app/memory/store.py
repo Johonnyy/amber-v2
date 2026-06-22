@@ -52,6 +52,14 @@ CREATE TABLE IF NOT EXISTS tasks (
     created_at   TEXT    NOT NULL,
     completed_at TEXT
 );
+
+CREATE TABLE IF NOT EXISTS reminders (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    text       TEXT    NOT NULL,
+    remind_at  TEXT,                              -- ISO-8601, or NULL if no time given
+    status     TEXT    NOT NULL DEFAULT 'pending',  -- 'pending' | 'done'
+    created_at TEXT    NOT NULL
+);
 """
 
 
@@ -190,6 +198,31 @@ class MemoryStore:
             )
             self._conn.commit()
             return cur.rowcount > 0
+
+    # --- reminders (Phase 4 set_reminder tool) ---
+
+    def add_reminder(self, text: str, remind_at: str | None = None) -> int:
+        """Persist a reminder. ``remind_at`` is an ISO-8601 time, or ``None`` if
+        the user gave no time. Delivery/firing is future work (needs a scheduler
+        and a server-initiated push frame); this durably records the intent."""
+        text = text.strip()
+        with self._lock:
+            cur = self._conn.execute(
+                "INSERT INTO reminders (text, remind_at, status, created_at) "
+                "VALUES (?, ?, 'pending', ?)",
+                (text, remind_at, _now()),
+            )
+            self._conn.commit()
+            return int(cur.lastrowid)
+
+    def pending_reminders(self) -> list[dict]:
+        """Reminders not yet delivered, oldest first."""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT id, text, remind_at, status, created_at FROM reminders "
+                "WHERE status = 'pending' ORDER BY id ASC"
+            ).fetchall()
+        return [dict(r) for r in rows]
 
 
 @lru_cache

@@ -73,3 +73,15 @@ def test_tasks_open_complete_lifecycle(store):
     # Completing an already-done (or unknown) task reports no change.
     assert store.complete_task(a) is False
     assert store.complete_task(9999) is False
+
+
+def test_reminders_persist_pending(store):
+    store.add_reminder("call mom", "2026-06-22T17:30:00")
+    store.add_reminder("water plants")  # no time
+
+    pending = store.pending_reminders()
+    assert [(r["text"], r["remind_at"]) for r in pending] == [
+        ("call mom", "2026-06-22T17:30:00"),
+        ("water plants", None),
+    ]
+    assert all(r["status"] == "pending" for r in pending)

@@ -1,0 +1,41 @@
+"""Amber's tools (Phase 4) — inline tools + the OpenClaw bridge.
+
+Two kinds, by the load-bearing distinction in the design:
+
+* **Inline tools** — fast and local to Amber: ``web_search``, the task tools
+  (``add_task`` / ``list_tasks`` / ``complete_task``), and ``set_reminder``.
+* **OpenClaw bridge** — ``delegate_to_openclaw`` for anything heavier (calendar,
+  email, files, browsing), sent over HTTP to a separate service and awaited.
+
+Importing this package *registers* every tool on the shared ``registry`` — the
+submodule imports below run the ``@registry.register`` decorators. The brain pulls
+schemas and dispatches calls through the two helpers exported here, so the rest of
+the app depends only on ``app.tools`` and never reaches into individual modules.
+"""
+
+from __future__ import annotations
+
+from typing import Any
+
+# Importing the submodules is what populates the registry. Order is irrelevant.
+from app.tools import openclaw, reminders, search, tasks  # noqa: F401
+from app.tools.registry import Tool, ToolRegistry, registry
+
+
+def get_tool_schemas() -> list[dict[str, Any]]:
+    """Anthropic-format schemas for every currently-available tool."""
+    return registry.schemas()
+
+
+async def run_tool(name: str, tool_input: dict[str, Any] | None) -> str:
+    """Execute a tool by name; returns the ``tool_result`` content string."""
+    return await registry.dispatch(name, tool_input)
+
+
+__all__ = [
+    "registry",
+    "Tool",
+    "ToolRegistry",
+    "get_tool_schemas",
+    "run_tool",
+]

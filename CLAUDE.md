@@ -108,10 +108,26 @@ false`. Both speak the same `AsyncIterator[str]` contract, so the pipeline
 downstream of the brain is unchanged.
 
 Persistent memory (Phase 3) lives in the `app/memory/` package: `store.py` (SQLite
-`facts`/`conversations`/`tasks` tables + sync CRUD, `get_store()`), `writer.py`
-(`remember` — distil facts from an exchange via a cheap LLM call, after the turn is
-spoken), and `context.py` (`build_context` — rank relevant facts into a compressed
-prompt block before each turn). Gated by `AMBER_FEATURE_MEMORY`; the read half runs
-inline before the brain, the write half runs off the latency path after
-`turn_complete`. Memory is *persistent cross-session knowledge*, distinct from the
-in-memory per-connection history in `app/session.py` — don't conflate them.
+`facts`/`conversations`/`tasks`/`reminders` tables + sync CRUD, `get_store()`),
+`writer.py` (`remember` — distil facts from an exchange via a cheap LLM call, after
+the turn is spoken), and `context.py` (`build_context` — rank relevant facts into a
+compressed prompt block before each turn). Gated by `AMBER_FEATURE_MEMORY`; the
+read half runs inline before the brain, the write half runs off the latency path
+after `turn_complete`. Memory is *persistent cross-session knowledge*, distinct
+from the in-memory per-connection history in `app/session.py` — don't conflate them.
+
+Tools (Phase 4) live in the `app/tools/` package, gated by `AMBER_FEATURE_TOOLS`.
+`registry.py` is the pattern: `@registry.register(name, description, input_schema)`
+decorates a Python function (sync or async) returning a result string; `schemas()`
+exports the Anthropic `tools=[...]` list and `dispatch()` runs a call, converting
+any error into a string so a bad tool never crashes a turn. A tool may carry an
+`available()` predicate — unavailable tools are hidden and refuse to run. Inline
+tools: `search.py` (`web_search`; provider `duckduckgo` keyless / `tavily`),
+`tasks.py` (`add_task`/`list_tasks`/`complete_task` over the store), `reminders.py`
+(`set_reminder` — persists to the `reminders` table; firing/delivery is future
+work). The OpenClaw bridge is `openclaw.py` (`delegate_to_openclaw` — POSTs a
+natural-language task to `AMBER_OPENCLAW_URL` with a bearer `AMBER_OPENCLAW_TOKEN`
+and blocks for the result; only offered when a URL is set). The agentic loop —
+stream → `tool_use` → execute → feed results back → repeat to `max_tool_iterations`
+— lives in `app/brain.py`; it works on a copy of the history so only spoken text is
+recorded, leaving everything downstream of the brain unchanged.

@@ -28,6 +28,14 @@ def test_env_overrides(monkeypatch):
     assert s.port == 9001
 
 
+def test_tool_defaults():
+    s = _fresh()
+    assert s.feature_tools is True
+    assert s.search_provider == "duckduckgo"
+    assert s.openclaw_url == ""  # bridge disabled until configured
+    assert s.max_tool_iterations == 5
+
+
 def test_auth_enabled_follows_secret():
     assert _fresh(auth_secret="").auth_enabled is False
     assert _fresh(auth_secret="hunter2").auth_enabled is True

@@ -26,7 +26,6 @@ from collections.abc import Iterable
 
 from anthropic import AsyncAnthropic
 
-from app.brain import get_client
 from app.config import Settings, get_settings
 from app.memory.store import MemoryStore, get_store
 
@@ -105,7 +104,14 @@ async def extract_facts(
     if not user_text.strip() or not assistant_text.strip():
         return []
     settings = settings or get_settings()
-    client = client or get_client()
+    if client is None:
+        # Imported lazily: the brain (transitively) imports the tools package,
+        # which imports memory — a module-level `from app.brain import get_client`
+        # would close that loop into a circular import. The client is only needed
+        # at call time, so fetch it here.
+        from app.brain import get_client
+
+        client = get_client()
 
     resp = await client.messages.create(
         model=settings.memory_model,

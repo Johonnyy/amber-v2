@@ -66,6 +66,29 @@ class Settings(BaseSettings):
     # the store.
     memory_max_new_facts: int = 5
 
+    # --- Tools (Phase 4) ---
+    # Max tool-use round trips the brain will make in one turn before it must
+    # answer with what it has. A backstop against a model that loops on tools.
+    max_tool_iterations: int = 5
+    # Web search (inline tool). Provider selects the backend:
+    #   "duckduckgo" — keyless Instant Answer API (default; quick factual lookups)
+    #   "tavily"     — LLM-oriented search; requires search_api_key.
+    search_provider: str = "duckduckgo"
+    search_api_key: str = ""
+    # Hard cap on result snippets folded into one tool result (kept small — the
+    # model pays for them in tokens, and voice answers are short).
+    search_max_results: int = 3
+    search_timeout_s: float = 10.0
+    # OpenClaw bridge — heavy/delegated work over HTTP to the separate OpenClaw
+    # service. The tool is only offered to the model when a URL is configured.
+    # ``openclaw_url`` is the host/gateway (e.g. "https://10.0.0.5:8080"),
+    # ``openclaw_token`` the gateway/bearer token sent as Authorization.
+    openclaw_url: str = ""
+    openclaw_token: str = ""
+    # OpenClaw work can be slow (browser, multi-step); allow a generous timeout —
+    # the bridge blocks the response until it returns.
+    openclaw_timeout_s: float = 60.0
+
     # --- Feature flags ---
     feature_stt: bool = True
     # When false, the LLM brain is bypassed and the Phase-1 canned greeting is
@@ -74,6 +97,9 @@ class Settings(BaseSettings):
     # When false, no memory is read into the prompt and no facts are extracted —
     # the pipeline behaves exactly as Phase 2. Lets the loop run with no DB.
     feature_memory: bool = True
+    # When false, the brain never offers tools to the model — it streams a direct
+    # reply exactly as Phase 2/3. Lets the loop run without any tool plumbing.
+    feature_tools: bool = True
 
     # --- Auth (Phase 5; disabled when empty) ---
     auth_secret: str = ""
