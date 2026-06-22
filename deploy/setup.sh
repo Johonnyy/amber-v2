@@ -17,7 +17,7 @@ APP_USER="amber"
 ENV_FILE="$APP_DIR/.env"
 SERVICE_SRC="$APP_DIR/deploy/amber.service"
 SERVICE_DST="/etc/systemd/system/amber.service"
-PYTHON="python3.11"
+PYTHON=""   # resolved in step 1; the app requires Python >= 3.11
 
 # --- pretty output -----------------------------------------------------------
 c_blue=$'\033[1;34m'; c_green=$'\033[1;32m'; c_yellow=$'\033[1;33m'; c_red=$'\033[1;31m'; c_off=$'\033[0m'
@@ -45,15 +45,38 @@ ask_secret() {  # ask_secret "Prompt"  -> echoes answer, input hidden
 
 [ "$(id -u)" -eq 0 ] || die "run as root (try: sudo bash $0)"
 
+# Is $1 a python that's >= 3.11 and can build a venv?
+py_ok() {
+  command -v "$1" >/dev/null 2>&1 || return 1
+  "$1" -c 'import sys; raise SystemExit(0 if sys.version_info[:2] >= (3, 11) else 1)' 2>/dev/null
+}
+
 # --- 1. system deps ----------------------------------------------------------
-step "Installing system packages (python3.11, venv, git)"
-if command -v apt-get >/dev/null 2>&1; then
-  apt-get update -qq
-  apt-get install -y "$PYTHON" "${PYTHON}-venv" git >/dev/null
-  ok "packages installed"
+step "Installing system packages (Python >= 3.11, venv, git)"
+command -v apt-get >/dev/null 2>&1 || die "this script expects apt (Debian/Ubuntu)"
+apt-get update -qq
+apt-get install -y git >/dev/null
+
+# Pick an existing suitable interpreter (distro default first — e.g. 3.12 on
+# Ubuntu 24.04 — then explicit minor versions).
+for cand in python3 python3.13 python3.12 python3.11; do
+  if py_ok "$cand"; then PYTHON="$cand"; break; fi
+done
+
+if [ -n "$PYTHON" ]; then
+  # Ensure venv support for the chosen interpreter (package name tracks its version).
+  pyver="$("$PYTHON" -c 'import sys; print("%d.%d" % sys.version_info[:2])')"
+  apt-get install -y "python${pyver}-venv" >/dev/null 2>&1 || apt-get install -y python3-venv >/dev/null
+  ok "using $PYTHON ($("$PYTHON" --version 2>&1))"
 else
-  warn "apt-get not found — install $PYTHON, ${PYTHON}-venv and git yourself, then re-run"
-  command -v "$PYTHON" >/dev/null 2>&1 || die "$PYTHON missing"
+  warn "no Python >= 3.11 found — installing python3.11 from the deadsnakes PPA"
+  apt-get install -y software-properties-common >/dev/null
+  add-apt-repository -y ppa:deadsnakes/ppa >/dev/null
+  apt-get update -qq
+  apt-get install -y python3.11 python3.11-venv >/dev/null
+  py_ok python3.11 || die "python3.11 install failed"
+  PYTHON="python3.11"
+  ok "installed $($PYTHON --version 2>&1)"
 fi
 
 # --- 2. dedicated user -------------------------------------------------------
