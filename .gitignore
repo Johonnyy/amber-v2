@@ -1,0 +1,34 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+env/
+
+# Env / secrets
+.env
+*.env
+!.env.example
+
+# Test / tooling
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Data (SQLite lands here in Phase 3)
+*.db
+*.sqlite
+*.sqlite3
+data/
+
+# OS / editor
+.DS_Store
+*.swp
+.idea/
+.vscode/

@@ -1,0 +1,33 @@
+# systemd unit for Amber — install on the OVH VPS at /etc/systemd/system/amber.service
+#
+# Assumes:
+#   - app deployed to /opt/amber  (clone or rsync this repo there)
+#   - a virtualenv at /opt/amber/.venv with deps installed
+#   - /opt/amber/.env present (copied from .env.example, secrets filled in)
+#   - a dedicated unprivileged user `amber`
+#
+# See deploy/README.md for the full first-time setup.
+
+[Unit]
+Description=Amber voice backend
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=amber
+Group=amber
+WorkingDirectory=/opt/amber
+EnvironmentFile=/opt/amber/.env
+ExecStart=/opt/amber/.venv/bin/uvicorn app.main:app --host 0.0.0.0 --port 8000
+Restart=on-failure
+RestartSec=3
+
+# Hardening
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=true
+
+[Install]
+WantedBy=multi-user.target
