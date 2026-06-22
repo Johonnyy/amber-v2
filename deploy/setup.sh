@@ -91,6 +91,11 @@ fi
 # --- 3. code -----------------------------------------------------------------
 step "Fetching the code into $APP_DIR"
 if [ -d "$APP_DIR/.git" ]; then
+  # The checkout may have been created by root (or another user). git refuses to
+  # operate on a repo it doesn't own ("dubious ownership"), so hand it to amber
+  # and register a safe.directory exception for amber's git config.
+  chown -R "$APP_USER:$APP_USER" "$APP_DIR"
+  sudo -u "$APP_USER" git config --global --add safe.directory "$APP_DIR" 2>/dev/null || true
   sudo -u "$APP_USER" git -C "$APP_DIR" pull --ff-only
   ok "repo updated"
 else
