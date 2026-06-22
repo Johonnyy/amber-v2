@@ -21,14 +21,31 @@ enable the systemd unit, and run a health check.
 
 ## Updating after a code change
 
-[`update.sh`](update.sh) pulls the latest from
-`https://github.com/Johonnyy/amber-v2`, reinstalls deps **only if** the dependency
-files changed, reinstalls the systemd unit if it changed, restarts, and
-health-checks. Run as root:
+[`update.sh`](update.sh) is the **one command** to bring a deploy fully in sync
+with the repo — you should never have to hand-edit `.env` or touch systemd. Run as
+root:
 
 ```bash
 sudo bash /opt/amber/deploy/update.sh
 ```
+
+It reconciles everything, each step idempotent:
+
+- **code** — `git pull --ff-only` (clear error if the checkout diverged).
+- **python/venv** — rebuilds `.venv` if its interpreter went missing or dropped
+  below 3.11 (e.g. the OS upgraded Python out from under it).
+- **deps** — reinstalls when a dependency file changed in the pull *or* the venv
+  was rebuilt.
+- **`.env`** — adds any new keys that appeared in `.env.example` (carrying their
+  defaults), then **prompts** for any required secret still unset or left as a
+  `...` placeholder (`AMBER_OPENAI_API_KEY`, and `AMBER_ANTHROPIC_API_KEY` unless
+  `AMBER_FEATURE_LLM=false`). Existing values and optional empties (e.g.
+  `AMBER_AUTH_SECRET`) are never touched. If a required secret is missing and
+  there's no terminal (cron), it warns and exits non-zero instead of starting a
+  broken service.
+- **systemd** — reinstalls the unit whenever the installed copy differs from the
+  repo's, then `daemon-reload`.
+- **restart + health check** on the port from `.env`.
 
 <details>
 <summary>Manual steps (if you'd rather not use the scripts)</summary>
