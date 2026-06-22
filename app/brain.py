@@ -35,21 +35,27 @@ def get_client() -> AsyncAnthropic:
     return AsyncAnthropic(api_key=settings.anthropic_api_key)
 
 
-async def think(messages: list[dict]) -> AsyncIterator[str]:
+async def think(
+    messages: list[dict], system: str | None = None
+) -> AsyncIterator[str]:
     """Stream Amber's reply for the given conversation history.
 
     ``messages`` is the Anthropic message list (alternating/​combinable
-    user/assistant turns); the persona system prompt is injected here, not stored
-    in the history. Yields text deltas as they arrive.
+    user/assistant turns); the system prompt is injected here, not stored in the
+    history. ``system`` is the full system prompt for this turn — Phase 3 passes
+    the persona prompt with a memory block appended (see
+    `app.persona.compose_system_prompt`); when omitted, the bare persona prompt is
+    used so the Phase-2 contract is unchanged. Yields text deltas as they arrive.
     """
     settings = get_settings()
     client = get_client()
+    system = system if system is not None else SYSTEM_PROMPT
 
     logger.debug("LLM: %d message(s) -> %s", len(messages), settings.llm_model)
     async with client.messages.stream(
         model=settings.llm_model,
         max_tokens=settings.llm_max_tokens,
-        system=SYSTEM_PROMPT,
+        system=system,
         messages=messages,
     ) as stream:
         async for text in stream.text_stream:

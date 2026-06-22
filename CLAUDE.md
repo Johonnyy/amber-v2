@@ -101,7 +101,17 @@ unit is `deploy/amber.service`; runs `uvicorn app.main:app` under user `amber` f
 Key modules: `app/config.py` (all models/keys/flags), `app/protocol.py` (WS wire
 contract), `app/sentence_splitter.py` (streaming seam), `app/pipeline.py` (the voice
 loop), `app/main.py` (FastAPI + `/ws`). The "brain" is `app/brain.py` (streamed
-Claude Haiku) with its personality in `app/persona.py`; `app/session.py` holds
-per-connection conversation history. `app/responder.py` is the canned fallback used
-when `AMBER_FEATURE_LLM=false`. Both speak the same `AsyncIterator[str]` contract,
-so the pipeline downstream of the brain is unchanged.
+Claude Haiku) with its personality in `app/persona.py` (`compose_system_prompt`
+appends the memory block); `app/session.py` holds per-connection conversation
+history. `app/responder.py` is the canned fallback used when `AMBER_FEATURE_LLM=
+false`. Both speak the same `AsyncIterator[str]` contract, so the pipeline
+downstream of the brain is unchanged.
+
+Persistent memory (Phase 3) lives in the `app/memory/` package: `store.py` (SQLite
+`facts`/`conversations`/`tasks` tables + sync CRUD, `get_store()`), `writer.py`
+(`remember` — distil facts from an exchange via a cheap LLM call, after the turn is
+spoken), and `context.py` (`build_context` — rank relevant facts into a compressed
+prompt block before each turn). Gated by `AMBER_FEATURE_MEMORY`; the read half runs
+inline before the brain, the write half runs off the latency path after
+`turn_complete`. Memory is *persistent cross-session knowledge*, distinct from the
+in-memory per-connection history in `app/session.py` — don't conflate them.

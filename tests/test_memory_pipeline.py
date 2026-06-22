@@ -1,0 +1,108 @@
+"""Integration: the pipeline reads memory into the prompt and writes it back.
+
+STT/TTS and both memory halves are faked; this asserts the *wiring* — that the
+context block reaches the brain's system prompt, and that the writer is called with
+the real exchange only after a genuine turn.
+"""
+
+import pytest
+
+import app.pipeline as pipeline
+from app.session import Conversation
+
+
+class FakeSink:
+    def __init__(self):
+        self.json = []
+        self.bytes = []
+
+    async def send_json(self, payload):
+        self.json.append(payload)
+
+    async def send_bytes(self, data):
+        self.bytes.append(data)
+
+
+@pytest.fixture
+def fake_io(monkeypatch):
+    async def fake_transcribe(audio, **kw):
+        return "I have a dog named Mango"
+
+    async def fake_synthesize(text):
+        return f"AUDIO[{text}]".encode()
+
+    monkeypatch.setattr(pipeline, "transcribe", fake_transcribe)
+    monkeypatch.setattr(pipeline, "synthesize", fake_synthesize)
+
+
+async def test_memory_block_reaches_the_brain_system_prompt(fake_io, monkeypatch):
+    seen = {}
+
+    async def fake_build_context(query=None, **kw):
+        seen["query"] = query
+        return "What you remember about your user:\n- Has a dog named Mango"
+
+    async def fake_think(messages, system=None):
+        seen["system"] = system
+        yield "Hello there."
+
+    async def no_remember(user_text, reply, **kw):
+        return []
+
+    monkeypatch.setattr(pipeline, "build_context", fake_build_context)
+    monkeypatch.setattr(pipeline, "think", fake_think)
+    monkeypatch.setattr(pipeline, "remember", no_remember)
+
+    sink = FakeSink()
+    await pipeline.run_turn(b"audio", sink.send_json, sink.send_bytes, Conversation())
+
+    # Context builder saw the user's transcript as its relevance query.
+    assert seen["query"] == "I have a dog named Mango"
+    # The memory block was appended to the persona prompt handed to the brain.
+    assert "Has a dog named Mango" in seen["system"]
+    assert "You are Amber" in seen["system"]  # persona still present
+
+
+async def test_writer_called_with_exchange_after_turn(fake_io, monkeypatch):
+    calls = []
+
+    async def no_context(query=None, **kw):
+        return None
+
+    async def fake_think(messages, system=None):
+        yield "Nice, Mango sounds lovely."
+
+    async def spy_remember(user_text, reply, **kw):
+        calls.append((user_text, reply))
+        return ["Has a dog named Mango"]
+
+    monkeypatch.setattr(pipeline, "build_context", no_context)
+    monkeypatch.setattr(pipeline, "think", fake_think)
+    monkeypatch.setattr(pipeline, "remember", spy_remember)
+
+    sink = FakeSink()
+    await pipeline.run_turn(b"audio", sink.send_json, sink.send_bytes, Conversation())
+
+    assert calls == [("I have a dog named Mango", "Nice, Mango sounds lovely.")]
+
+
+async def test_writer_failure_does_not_break_the_turn(fake_io, monkeypatch):
+    async def no_context(query=None, **kw):
+        return None
+
+    async def fake_think(messages, system=None):
+        yield "All good."
+
+    async def boom_remember(user_text, reply, **kw):
+        raise RuntimeError("extraction exploded")
+
+    monkeypatch.setattr(pipeline, "build_context", no_context)
+    monkeypatch.setattr(pipeline, "think", fake_think)
+    monkeypatch.setattr(pipeline, "remember", boom_remember)
+
+    sink = FakeSink()
+    # Must not raise — memory is best-effort.
+    spoken = await pipeline.run_turn(
+        b"audio", sink.send_json, sink.send_bytes, Conversation()
+    )
+    assert spoken >= 1

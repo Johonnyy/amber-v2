@@ -49,12 +49,31 @@ class Settings(BaseSettings):
     # Cap on a single spoken reply. Voice answers are short; keep this modest so
     # a runaway generation can't stream for minutes. Bump it for longer replies.
     llm_max_tokens: int = 1024
+    # The memory writer's fact-extraction model (Phase 3). Off the latency path, so
+    # it could be a beefier model; defaults to the brain's for cost/simplicity.
+    memory_model: str = "claude-haiku-4-5-20251001"
+    # Token cap for one fact-extraction call. Output is a short JSON list; keep low.
+    memory_extract_max_tokens: int = 512
+
+    # --- Memory (Phase 3) ---
+    # SQLite file holding persistent cross-session knowledge (facts/conversations/
+    # tasks). Distinct from per-connection history (see app/session.py).
+    memory_db_path: str = "amber.db"
+    # Hard cap on facts injected into the system prompt per turn. Memory is paid for
+    # in tokens on every call — keep it small and high-signal.
+    memory_max_facts: int = 12
+    # Hard cap on new facts kept from a single exchange, so one turn can't flood
+    # the store.
+    memory_max_new_facts: int = 5
 
     # --- Feature flags ---
     feature_stt: bool = True
     # When false, the LLM brain is bypassed and the Phase-1 canned greeting is
     # returned instead. Lets the pipe run without an Anthropic key (tests, demos).
     feature_llm: bool = True
+    # When false, no memory is read into the prompt and no facts are extracted —
+    # the pipeline behaves exactly as Phase 2. Lets the loop run with no DB.
+    feature_memory: bool = True
 
     # --- Auth (Phase 5; disabled when empty) ---
     auth_secret: str = ""

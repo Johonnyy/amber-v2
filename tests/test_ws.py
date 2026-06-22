@@ -16,14 +16,23 @@ def faked_io(monkeypatch):
     async def fake_synthesize(text):
         return f"AUDIO[{text}]".encode()
 
-    async def fake_think(messages):
+    async def fake_think(messages, system=None):
         # Multi-sentence so the streaming seam produces >= 2 audio frames.
         for chunk in ["Hello back. ", "Good to hear from you."]:
             yield chunk
 
+    async def no_context(query=None, **kw):
+        return None
+
+    async def no_remember(user_text, reply, **kw):
+        return []
+
     monkeypatch.setattr(pipeline, "transcribe", fake_transcribe)
     monkeypatch.setattr(pipeline, "synthesize", fake_synthesize)
     monkeypatch.setattr(pipeline, "think", fake_think)
+    # Keep the WS smoke test offline: stub the memory read/write halves.
+    monkeypatch.setattr(pipeline, "build_context", no_context)
+    monkeypatch.setattr(pipeline, "remember", no_remember)
 
 
 def test_full_turn_over_websocket(faked_io):
