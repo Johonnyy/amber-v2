@@ -1,7 +1,7 @@
 [project]
 name = "amber"
 version = "0.1.0"
-description = "Amber — a cloud-hosted personal AI voice backend. Phase 4: tools."
+description = "Amber — a cloud-hosted personal AI voice backend. Phase 5: polish & reliability."
 requires-python = ">=3.11"
 dependencies = [
     "fastapi>=0.115",

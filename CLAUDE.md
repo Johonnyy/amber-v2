@@ -131,3 +131,18 @@ and blocks for the result; only offered when a URL is set). The agentic loop —
 stream → `tool_use` → execute → feed results back → repeat to `max_tool_iterations`
 — lives in `app/brain.py`; it works on a copy of the history so only spoken text is
 recorded, leaving everything downstream of the brain unchanged.
+
+Reliability (Phase 5) is concentrated in the transport layer. `app/session.py` now
+holds, besides `Conversation` (the per-turn history, capped by `max_history_turns`),
+a `Session` (stable id + retained conversation + per-session limiter) and a
+`SessionManager` (`get_session_manager()`): it mints a session id, keeps a dropped
+connection's history warm for `session_ttl_s` so a reconnect with `?session_id=`
+resumes, and evicts by TTL / `max_sessions`. `app/ratelimit.py` is a sliding-window
+`RateLimiter` (one per session). `app/main.py` ties it together: auth via
+`AMBER_AUTH_SECRET` (`?token=` or `Authorization: Bearer`), the session handshake
+(id returned in `ready`), and `_admit_utterance` — the cost guardrails
+(`max_audio_bytes`, `rate_limit_turns`/`window`, `max_turns_per_session`) that
+reject an utterance with a coded `error` frame *before* any STT/LLM/TTS spend. A
+failed turn becomes an `error` frame, never a dropped socket; logs are tagged with
+the session id. Protocol changes are additive (new `ready.session_id`, optional
+`error.code`), so existing clients keep working.

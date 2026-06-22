@@ -101,7 +101,34 @@ class Settings(BaseSettings):
     # reply exactly as Phase 2/3. Lets the loop run without any tool plumbing.
     feature_tools: bool = True
 
+    # --- Sessions (Phase 5) ---
+    # How long an idle session's in-memory history is retained for reconnect/
+    # resume, in seconds. A client that reconnects with its id inside this window
+    # picks up where it left off; after it, the id starts a fresh session.
+    session_ttl_s: float = 1800.0  # 30 minutes
+    # Hard cap on concurrently retained sessions (memory guardrail). Past this the
+    # least-recently-active sessions are evicted. 0 disables the cap.
+    max_sessions: int = 1000
+    # Cap on conversation *turns* (user+assistant pairs) kept in a session's
+    # in-memory history. Older turns drop off so the context window — and the
+    # tokens every turn pays for it — stays bounded. 0 disables trimming.
+    max_history_turns: int = 50
+
+    # --- Rate limiting & cost guardrails (Phase 5) ---
+    # Max utterances processed per session within the rolling window. Protects the
+    # STT/LLM/TTS spend from a stuck or abusive client. 0 disables.
+    rate_limit_turns: int = 30
+    rate_limit_window_s: float = 60.0
+    # Reject an inbound utterance larger than this (bytes) before spending STT. 0
+    # disables the size check.
+    max_audio_bytes: int = 10 * 1024 * 1024  # 10 MB
+    # Hard cap on total utterances over a single session's lifetime (cost
+    # guardrail). 0 disables.
+    max_turns_per_session: int = 0
+
     # --- Auth (Phase 5; disabled when empty) ---
+    # Shared secret clients present to connect: as ``?token=`` on the WS URL, or an
+    # ``Authorization: Bearer <secret>`` header. Empty = auth off (open socket).
     auth_secret: str = ""
 
     @property

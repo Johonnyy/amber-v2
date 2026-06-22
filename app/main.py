@@ -1,25 +1,37 @@
 """FastAPI application + the WebSocket voice endpoint.
 
 This is the thin transport layer. All the real work lives in `app.pipeline`; here
-we just accept the socket, route frames, and wire interruption.
+we accept the socket, authenticate it, attach a session, route frames, wire
+interruption, and enforce the cost/abuse guardrails.
 
 Every client speaks the protocol in `app.protocol`:
   * binary frame in  = a recorded utterance -> triggers a turn
   * ``{"type": "interrupt"}`` in = stop speaking the current turn
   * binary while already speaking = barge-in (cancel current turn, start the new one)
+
+Phase 5 additions:
+  * **Auth** — when ``AMBER_AUTH_SECRET`` is set, a client must present it as
+    ``?token=`` or an ``Authorization: Bearer`` header, or the socket is refused.
+  * **Sessions** — each connection gets a session id (sent in ``ready``). A client
+    that reconnects with ``?session_id=`` resumes its retained history.
+  * **Guardrails** — oversized utterances, per-session rate limits, and a lifetime
+    turn cap are rejected with a coded ``error`` frame before any spend.
+  * **Error recovery** — a single failed turn becomes an ``error`` frame, never a
+    dropped connection; logs are tagged with the session id.
 """
 
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, status
 
 from app import protocol
-from app.config import get_settings
+from app.config import Settings, get_settings
 from app.pipeline import run_turn
-from app.session import Conversation
+from app.session import Session, SessionManager, get_session_manager
 
 settings = get_settings()
 logging.basicConfig(
@@ -37,34 +49,52 @@ async def health() -> dict[str, str]:
     return {"status": "ok", "service": "amber", "version": app.version}
 
 
+def _authorized(websocket: WebSocket, settings: Settings) -> bool:
+    """True if the socket may connect. Open when no secret is configured; otherwise
+    the secret must arrive as ``?token=`` or ``Authorization: Bearer <secret>``."""
+    if not settings.auth_enabled:
+        return True
+    token = websocket.query_params.get("token", "")
+    if not token:
+        header = websocket.headers.get("authorization", "")
+        if header.lower().startswith("bearer "):
+            token = header[7:].strip()
+    return token == settings.auth_secret
+
+
 @app.websocket("/ws")
 async def voice_socket(websocket: WebSocket) -> None:
-    if settings.auth_enabled:
-        token = websocket.query_params.get("token", "")
-        if token != settings.auth_secret:
-            await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
-            logger.warning("Rejected WS connection: bad/missing token")
-            return
+    settings = get_settings()
+    if not _authorized(websocket, settings):
+        await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
+        logger.warning("Rejected WS connection: bad/missing token")
+        return
 
     await websocket.accept()
-    logger.info("Client connected")
-    await websocket.send_json(protocol.ready())
 
-    # send helpers bound to this socket, passed into the pipeline
+    manager = get_session_manager()
+    requested = websocket.query_params.get("session_id") or None
+    session, resumed = manager.resume_or_create(requested)
+    await websocket.send_json(protocol.ready(session.id, resumed))
+    logger.info(
+        "[%s] Client %s (%d turn(s) of history)",
+        session.id,
+        "resumed" if resumed else "connected",
+        len(session.conversation.messages),
+    )
+
     async def send_json(payload: dict) -> None:
         await websocket.send_json(payload)
 
     async def send_bytes(data: bytes) -> None:
         await websocket.send_bytes(data)
 
-    # Conversation history for this connection only (Phase 2). Dies with the socket.
-    conversation = Conversation()
     current_turn: asyncio.Task | None = None
 
     async def cancel_current(reason: str) -> None:
         nonlocal current_turn
         if current_turn and not current_turn.done():
-            logger.info("Interrupting current turn (%s)", reason)
+            logger.info("[%s] Interrupting current turn (%s)", session.id, reason)
             current_turn.cancel()
             try:
                 await current_turn
@@ -81,49 +111,105 @@ async def voice_socket(websocket: WebSocket) -> None:
 
             data = message.get("bytes")
             if data is not None:
+                if not await _admit_utterance(data, session, settings, send_json):
+                    continue
                 # New utterance. Barge-in: drop any in-flight turn first.
                 await cancel_current("barge-in")
+                session.turns += 1
+                manager.touch(session)
                 current_turn = asyncio.create_task(
-                    _guarded_turn(data, send_json, send_bytes, conversation)
+                    _guarded_turn(
+                        data, send_json, send_bytes, session.conversation, session.id
+                    )
                 )
                 continue
 
             text = message.get("text")
             if text is not None:
-                await _handle_control(text, cancel_current)
+                await _handle_control(text, cancel_current, session.id)
 
     except WebSocketDisconnect:
-        logger.info("Client disconnected")
+        logger.info("[%s] Client disconnected", session.id)
     finally:
         await cancel_current("connection closing")
-        logger.info("Session ended")
+        # Don't drop the session: keep it warm so a reconnect with this id resumes.
+        # The manager's TTL reclaims it if the client never comes back.
+        manager.touch(session)
+        logger.info("[%s] Session detached (retained for resume)", session.id)
 
 
-async def _handle_control(text: str, cancel_current) -> None:
+async def _admit_utterance(
+    data: bytes, session: Session, settings: Settings, send_json
+) -> bool:
+    """Apply the cost/abuse guardrails to an inbound utterance.
+
+    Returns ``True`` if the turn may proceed; otherwise sends a coded ``error``
+    frame and returns ``False``. Checks run cheapest-first so a rejected utterance
+    spends nothing on STT/LLM/TTS.
+    """
+    if settings.max_audio_bytes > 0 and len(data) > settings.max_audio_bytes:
+        logger.warning(
+            "[%s] Rejected oversize utterance: %d > %d bytes",
+            session.id,
+            len(data),
+            settings.max_audio_bytes,
+        )
+        await send_json(
+            protocol.error("That audio is too large.", protocol.ERR_PAYLOAD_TOO_LARGE)
+        )
+        return False
+
+    if (
+        settings.max_turns_per_session > 0
+        and session.turns >= settings.max_turns_per_session
+    ):
+        logger.warning("[%s] Session lifetime turn cap reached", session.id)
+        await send_json(
+            protocol.error(
+                "This session has reached its limit. Reconnect to continue.",
+                protocol.ERR_SESSION_LIMIT,
+            )
+        )
+        return False
+
+    if not session.limiter.allow():
+        logger.warning("[%s] Rate limited", session.id)
+        await send_json(
+            protocol.error(
+                "You're going a bit fast — give me a moment.",
+                protocol.ERR_RATE_LIMITED,
+            )
+        )
+        return False
+
+    return True
+
+
+async def _handle_control(text: str, cancel_current, session_id: str) -> None:
     """Handle an inbound JSON control frame."""
-    import json
-
     try:
         payload = json.loads(text)
     except json.JSONDecodeError:
-        logger.warning("Ignoring non-JSON text frame: %r", text[:120])
+        logger.warning("[%s] Ignoring non-JSON text frame: %r", session_id, text[:120])
         return
 
     if payload.get("type") == protocol.INTERRUPT:
         await cancel_current("client interrupt")
     else:
-        logger.debug("Ignoring unknown control frame: %r", payload)
+        logger.debug("[%s] Ignoring unknown control frame: %r", session_id, payload)
 
 
-async def _guarded_turn(audio: bytes, send_json, send_bytes, conversation) -> None:
+async def _guarded_turn(
+    audio: bytes, send_json, send_bytes, conversation, session_id: str
+) -> None:
     """Run one turn, converting failures into an error frame instead of a crash."""
     try:
         await run_turn(audio, send_json, send_bytes, conversation)
     except asyncio.CancelledError:
         raise  # interrupt/barge-in — expected, let it unwind
     except Exception as exc:  # noqa: BLE001 — surface any turn failure to the client
-        logger.exception("Turn failed")
+        logger.exception("[%s] Turn failed", session_id)
         try:
-            await send_json(protocol.error(str(exc)))
+            await send_json(protocol.error(str(exc), protocol.ERR_INTERNAL))
         except Exception:  # noqa: BLE001 — socket may already be gone
             pass
