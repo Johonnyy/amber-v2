@@ -89,6 +89,10 @@ async def voice_socket(websocket: WebSocket) -> None:
     async def send_bytes(data: bytes) -> None:
         await websocket.send_bytes(data)
 
+    # Attach this connection's send channel so client-declared tools can be called
+    # back over the socket. Detached again in the finally below.
+    session.client_tools.bind(send_json)
+
     current_turn: asyncio.Task | None = None
 
     async def cancel_current(reason: str) -> None:
@@ -118,20 +122,21 @@ async def voice_socket(websocket: WebSocket) -> None:
                 session.turns += 1
                 manager.touch(session)
                 current_turn = asyncio.create_task(
-                    _guarded_turn(
-                        data, send_json, send_bytes, session.conversation, session.id
-                    )
+                    _guarded_turn(data, send_json, send_bytes, session)
                 )
                 continue
 
             text = message.get("text")
             if text is not None:
-                await _handle_control(text, cancel_current, session.id)
+                await _handle_control(text, cancel_current, session)
 
     except WebSocketDisconnect:
         logger.info("[%s] Client disconnected", session.id)
     finally:
         await cancel_current("connection closing")
+        # Detach the send channel and fail any in-flight client tool calls; the
+        # declared tool specs are kept so a reconnect with this id still has them.
+        session.client_tools.unbind()
         # Don't drop the session: keep it warm so a reconnect with this id resumes.
         # The manager's TTL reclaims it if the client never comes back.
         manager.touch(session)
@@ -185,30 +190,45 @@ async def _admit_utterance(
     return True
 
 
-async def _handle_control(text: str, cancel_current, session_id: str) -> None:
+async def _handle_control(text: str, cancel_current, session: Session) -> None:
     """Handle an inbound JSON control frame."""
     try:
         payload = json.loads(text)
     except json.JSONDecodeError:
-        logger.warning("[%s] Ignoring non-JSON text frame: %r", session_id, text[:120])
+        logger.warning(
+            "[%s] Ignoring non-JSON text frame: %r", session.id, text[:120]
+        )
         return
 
-    if payload.get("type") == protocol.INTERRUPT:
+    kind = payload.get("type")
+    if kind == protocol.INTERRUPT:
         await cancel_current("client interrupt")
+    elif kind == protocol.REGISTER_TOOLS:
+        names = session.client_tools.register(payload.get("tools"))
+        logger.info("[%s] Client registered %d tool(s): %s", session.id, len(names), names)
+    elif kind == protocol.TOOL_RESULT:
+        # A result for a client-side tool call the brain is awaiting.
+        session.client_tools.resolve(
+            payload.get("id"),
+            payload.get("content", ""),
+            bool(payload.get("is_error")),
+        )
     else:
-        logger.debug("[%s] Ignoring unknown control frame: %r", session_id, payload)
+        logger.debug("[%s] Ignoring unknown control frame: %r", session.id, payload)
 
 
 async def _guarded_turn(
-    audio: bytes, send_json, send_bytes, conversation, session_id: str
+    audio: bytes, send_json, send_bytes, session: Session
 ) -> None:
     """Run one turn, converting failures into an error frame instead of a crash."""
     try:
-        await run_turn(audio, send_json, send_bytes, conversation)
+        await run_turn(
+            audio, send_json, send_bytes, session.conversation, session.client_tools
+        )
     except asyncio.CancelledError:
         raise  # interrupt/barge-in — expected, let it unwind
     except Exception as exc:  # noqa: BLE001 — surface any turn failure to the client
-        logger.exception("[%s] Turn failed", session_id)
+        logger.exception("[%s] Turn failed", session.id)
         try:
             await send_json(protocol.error(str(exc), protocol.ERR_INTERNAL))
         except Exception:  # noqa: BLE001 — socket may already be gone

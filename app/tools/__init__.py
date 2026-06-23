@@ -3,9 +3,14 @@
 Two kinds, by the load-bearing distinction in the design:
 
 * **Inline tools** — fast and local to Amber: ``web_search``, the task tools
-  (``add_task`` / ``list_tasks`` / ``complete_task``), and ``set_reminder``.
+  (``add_task`` / ``list_tasks`` / ``complete_task``), ``set_reminder``, and
+  ``update_server`` (run the deploy update script; only offered when configured).
 * **OpenClaw bridge** — ``delegate_to_openclaw`` for anything heavier (calendar,
   email, files, browsing), sent over HTTP to a separate service and awaited.
+
+Client-declared tools (tools a *client* can run on its own device) are a separate
+mechanism that lives outside this registry — see ``app.client_tools`` — because
+they are per-connection and dispatched back over the WebSocket, not process-wide.
 
 Importing this package *registers* every tool on the shared ``registry`` — the
 submodule imports below run the ``@registry.register`` decorators. The brain pulls
@@ -18,7 +23,7 @@ from __future__ import annotations
 from typing import Any
 
 # Importing the submodules is what populates the registry. Order is irrelevant.
-from app.tools import openclaw, reminders, search, tasks  # noqa: F401
+from app.tools import openclaw, reminders, search, tasks, update  # noqa: F401
 from app.tools.registry import Tool, ToolRegistry, registry
 
 

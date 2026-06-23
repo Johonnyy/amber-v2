@@ -28,6 +28,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from collections.abc import AsyncIterator, Awaitable, Callable
+from typing import TYPE_CHECKING
 
 from app import protocol
 from app.brain import think
@@ -39,6 +40,9 @@ from app.sentence_splitter import SentenceSplitter
 from app.session import Conversation
 from app.stt import transcribe
 from app.tts import synthesize
+
+if TYPE_CHECKING:
+    from app.client_tools import ClientTools
 
 logger = logging.getLogger(__name__)
 
@@ -57,13 +61,16 @@ async def run_turn(
     send_json: SendJson,
     send_bytes: SendBytes,
     conversation: Conversation | None = None,
+    client_tools: "ClientTools | None" = None,
 ) -> int:
     """Process one user turn and stream the spoken reply back.
 
     ``conversation`` carries the per-connection history; if omitted a throwaway one
-    is used (single-turn, no memory). Returns the number of sentences spoken.
-    Raises on transport/API failure so the caller can emit an error frame;
-    ``asyncio.CancelledError`` from an interrupt is allowed to propagate untouched.
+    is used (single-turn, no memory). ``client_tools`` is the connection's declared
+    client-side tools (Phase 4+), offered to the brain alongside Amber's own.
+    Returns the number of sentences spoken. Raises on transport/API failure so the
+    caller can emit an error frame; ``asyncio.CancelledError`` from an interrupt is
+    allowed to propagate untouched.
     """
     settings = get_settings()
     conversation = conversation if conversation is not None else Conversation()
@@ -86,7 +93,7 @@ async def run_turn(
             spoken = await _speak_stream(_canned(_DIDNT_CATCH), send_json, send_bytes)
         else:
             spoken, reply = await _think_and_speak(
-                transcript_text, conversation, send_json, send_bytes
+                transcript_text, conversation, send_json, send_bytes, client_tools
             )
     finally:
         await send_json(protocol.thinking(False))
@@ -113,6 +120,7 @@ async def _think_and_speak(
     conversation: Conversation,
     send_json: SendJson,
     send_bytes: SendBytes,
+    client_tools: "ClientTools | None" = None,
 ) -> tuple[int, str]:
     """Record the user turn, stream a reply, and record what was spoken.
 
@@ -135,7 +143,7 @@ async def _think_and_speak(
         if memory_items:
             await send_json(protocol.memory(memory_items))
         system = compose_system_prompt(memory_block)
-        tokens = think(conversation.messages, system=system)
+        tokens = think(conversation.messages, system=system, client_tools=client_tools)
     else:
         tokens = respond(transcript_text)
 

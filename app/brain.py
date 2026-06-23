@@ -25,8 +25,9 @@ mutated with tool plumbing — only the spoken text is recorded by the pipeline.
 from __future__ import annotations
 
 import logging
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Awaitable, Callable
 from functools import lru_cache
+from typing import TYPE_CHECKING
 
 from anthropic import AsyncAnthropic
 
@@ -34,7 +35,13 @@ from app.config import Settings, get_settings
 from app.persona import SYSTEM_PROMPT
 from app.tools import get_tool_schemas, run_tool
 
+if TYPE_CHECKING:
+    from app.client_tools import ClientTools
+
 logger = logging.getLogger(__name__)
+
+# A tool dispatcher: (name, input) -> the string result fed back to the model.
+ToolDispatch = Callable[[str, dict], Awaitable[str]]
 
 
 @lru_cache
@@ -45,7 +52,10 @@ def get_client() -> AsyncAnthropic:
 
 
 async def think(
-    messages: list[dict], system: str | None = None
+    messages: list[dict],
+    system: str | None = None,
+    *,
+    client_tools: "ClientTools | None" = None,
 ) -> AsyncIterator[str]:
     """Stream Amber's reply for the given conversation history.
 
@@ -57,13 +67,22 @@ async def think(
     used so the Phase-2 contract is unchanged. Yields text deltas as they arrive.
 
     When tools are enabled the brain may make several LLM round trips to call tools
-    before the final answer; all spoken text streams through in order.
+    before the final answer; all spoken text streams through in order. ``client_tools``
+    (Phase 4+) is the connection's :class:`app.client_tools.ClientTools`: its
+    declared tools are offered alongside Amber's own, and any ``client_*`` call is
+    dispatched back over the WebSocket instead of through the server registry.
     """
     settings = get_settings()
     client = get_client()
     system = system if system is not None else SYSTEM_PROMPT
 
-    tools = get_tool_schemas() if settings.feature_tools else []
+    tools: list[dict] = []
+    if settings.feature_tools:
+        tools += get_tool_schemas()
+    if settings.feature_client_tools and client_tools is not None:
+        tools += client_tools.schemas()
+
+    dispatch = _make_dispatch(client_tools)
 
     if not tools:
         # No tools (flag off or none registered): the Phase-2/3 streaming path,
@@ -96,7 +115,9 @@ async def think(
         # The model wants tools: record its turn (text + tool_use), run the calls,
         # and hand the results back for the next iteration.
         working.append({"role": "assistant", "content": final.content})
-        working.append({"role": "user", "content": await _run_tool_calls(final.content)})
+        working.append(
+            {"role": "user", "content": await _run_tool_calls(final.content, dispatch)}
+        )
 
     # Iteration cap hit while still calling tools. Force a final answer with tools
     # off, so the user always hears a reply built from whatever was gathered.
@@ -125,18 +146,34 @@ async def _stream_once(
             yield text
 
 
-async def _run_tool_calls(content: list) -> list[dict]:
+def _make_dispatch(client_tools: "ClientTools | None") -> ToolDispatch:
+    """Build the per-turn tool dispatcher.
+
+    Client-declared (``client_*``) tools are routed back to the connecting client;
+    everything else goes through Amber's own process-wide registry. Both honor the
+    "never raise into the brain" contract — failures come back as strings.
+    """
+
+    async def dispatch(name: str, tool_input: dict) -> str:
+        if client_tools is not None and client_tools.handles(name):
+            return await client_tools.call(name, tool_input)
+        return await run_tool(name, tool_input)
+
+    return dispatch
+
+
+async def _run_tool_calls(content: list, dispatch: ToolDispatch) -> list[dict]:
     """Execute every ``tool_use`` block in an assistant turn, in order.
 
     Returns the matching ``tool_result`` blocks (one per call) as a single list,
-    to be sent back as one user message. Tools never raise here — the registry
+    to be sent back as one user message. Tools never raise here — ``dispatch``
     converts failures into a result string the model can react to.
     """
     results: list[dict] = []
     for block in content:
         if getattr(block, "type", None) == "tool_use":
             logger.info("Tool call: %s(%s)", block.name, block.input)
-            output = await run_tool(block.name, block.input)
+            output = await dispatch(block.name, block.input)
             results.append(
                 {
                     "type": "tool_result",

@@ -26,6 +26,18 @@ Memory surfacing (Phase 3) adds one more *additive* server -> client frame,
 clients render it (e.g. a memory panel) but it never affects the voice loop — so a
 client that ignores it behaves exactly as before. Sent at most once per turn,
 before the reply streams.
+
+Client-declared tools (Phase 4+) add three more *additive* frames so a client can
+expose capabilities of its own device (show text, play a sound, ...) for Amber to
+call:
+  * ``register_tools`` (client -> server) — the client lists tools it can run.
+    Each name is auto-prefixed with ``client_`` server-side.
+  * ``tool_call`` (server -> client) — Amber asks the client to run one of those
+    tools, carrying a correlation ``id``, the (prefixed) ``name``, and ``input``.
+  * ``tool_result`` (client -> server) — the client returns the result for that
+    ``id`` (with optional ``is_error``), which Amber feeds back to the model.
+A client that never sends ``register_tools`` is unaffected — no ``tool_call`` is
+ever sent to it.
 """
 
 from __future__ import annotations
@@ -34,6 +46,8 @@ from typing import Any
 
 # --- client -> server message types ---
 INTERRUPT = "interrupt"  # stop speaking mid-response
+REGISTER_TOOLS = "register_tools"  # client declares tools Amber may call on it
+TOOL_RESULT = "tool_result"  # the result of a client-side tool call (see TOOL_CALL)
 
 # --- server -> client message types ---
 READY = "ready"  # handshake accepted; server is listening
@@ -42,6 +56,7 @@ THINKING = "thinking"  # Amber is generating a response
 AUDIO_CHUNK = "audio_chunk"  # metadata; the NEXT binary frame is this sentence
 TURN_COMPLETE = "turn_complete"  # the full response has been sent
 MEMORY = "memory"  # what Amber currently remembers about the user (advisory)
+TOOL_CALL = "tool_call"  # asks the client to run one of its declared tools
 ERROR = "error"  # something went wrong this turn
 
 # --- error codes (the optional ``code`` field on an error frame) ---
@@ -101,6 +116,21 @@ def memory(items: list[str]) -> dict[str, Any]:
     is the same ranked set of distilled facts injected into the LLM's system prompt.
     """
     return {"type": MEMORY, "items": list(items)}
+
+
+def tool_call(call_id: str, name: str, tool_input: dict[str, Any]) -> dict[str, Any]:
+    """Ask the client to run one of its declared tools.
+
+    ``call_id`` correlates this request with the ``tool_result`` the client sends
+    back; ``name`` is the ``client_``-prefixed tool name; ``tool_input`` is the
+    arguments object the model produced for the call.
+    """
+    return {
+        "type": TOOL_CALL,
+        "id": call_id,
+        "name": name,
+        "input": tool_input,
+    }
 
 
 def error(message: str, code: str | None = None) -> dict[str, Any]:

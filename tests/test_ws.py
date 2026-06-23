@@ -22,7 +22,7 @@ def faked_io(monkeypatch):
     async def fake_synthesize(text):
         return f"AUDIO[{text}]".encode()
 
-    async def fake_think(messages, system=None):
+    async def fake_think(messages, system=None, **kwargs):
         # Multi-sentence so the streaming seam produces >= 2 audio frames.
         for chunk in ["Hello back. ", "Good to hear from you."]:
             yield chunk

@@ -88,6 +88,24 @@ class Settings(BaseSettings):
     # OpenClaw work can be slow (browser, multi-step); allow a generous timeout —
     # the bridge blocks the response until it returns.
     openclaw_timeout_s: float = 60.0
+    # ``update_server`` tool — runs the deploy update script on the box. The tool is
+    # only offered to the model when this command is set (empty = hidden), since it
+    # is a privileged, server-mutating action. The command is run through a shell.
+    # NOTE: the script restarts the amber service; configure it to run detached from
+    # the service cgroup (e.g. via ``systemd-run``) so the restart doesn't kill the
+    # update mid-flight — see .env.example.
+    update_command: str = ""
+    # How long to wait for the update command before giving up and returning to the
+    # model (the detached script keeps running regardless).
+    update_timeout_s: float = 120.0
+    # Client-provided tools (see app/client_tools.py). A client may declare tools it
+    # can run on its own device (text display, sounds, ...); Amber offers them to the
+    # model prefixed with ``client_`` and dispatches calls back over the WS.
+    # Hard cap on tools one client may register, to bound prompt token cost.
+    max_client_tools: int = 16
+    # How long the brain waits for a client to return a tool result before giving up
+    # on that call and telling the model it failed.
+    client_tool_timeout_s: float = 30.0
 
     # --- Feature flags ---
     feature_stt: bool = True
@@ -100,6 +118,10 @@ class Settings(BaseSettings):
     # When false, the brain never offers tools to the model — it streams a direct
     # reply exactly as Phase 2/3. Lets the loop run without any tool plumbing.
     feature_tools: bool = True
+    # When false, client-declared tools are ignored — the brain never offers them
+    # and never calls back to the client. Independent of ``feature_tools`` (which
+    # governs Amber's own server-side tools).
+    feature_client_tools: bool = True
 
     # --- Sessions (Phase 5) ---
     # How long an idle session's in-memory history is retained for reconnect/
