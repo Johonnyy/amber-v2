@@ -13,6 +13,9 @@ dependencies = [
     "python-dotenv>=1.0",
     # HTTP client for the inline web_search tool and the OpenClaw bridge (Phase 4).
     "httpx>=0.27",
+    # IANA tz database for zoneinfo — needed for AMBER_TIMEZONE on systems without a
+    # system tz db (e.g. Windows); harmless where one exists.
+    "tzdata>=2024.1",
 ]
 
 [project.optional-dependencies]

@@ -82,9 +82,26 @@ def _format_block(facts: list[dict], tasks: list[dict]) -> str | None:
     return "\n".join(lines)
 
 
+def _format_recap(messages: list[dict]) -> str | None:
+    """A short "where you left off" replay of the most recent durable messages.
+
+    ``messages`` arrives oldest-first (as ``store.recent_messages`` returns it), so
+    the recap reads in conversation order. Only used to cold-start a fresh session;
+    once the live history has turns it already carries recent context.
+    """
+    if not messages:
+        return None
+    lines = ["Picking up from your last conversation (oldest to newest):"]
+    for m in messages:
+        speaker = "You" if m["role"] == "assistant" else "They"
+        lines.append(f"- {speaker}: {m['content']}")
+    return "\n".join(lines)
+
+
 async def build_memory_view(
     query: str | None = None,
     *,
+    include_recap: bool = False,
     store: MemoryStore | None = None,
     settings: Settings | None = None,
 ) -> tuple[str | None, list[str]]:
@@ -93,12 +110,17 @@ async def build_memory_view(
     Returns ``(block, items)``:
 
     * ``block`` — the compressed text injected into the LLM's system prompt (or
-      ``None`` when there's nothing to inject), exactly as before.
-    * ``items`` — the same ranked facts as a flat list of strings, for surfacing to
-      the client over the ``memory`` protocol frame (empty when there are none).
+      ``None`` when there's nothing to inject). Durable facts and open tasks, plus —
+      when ``include_recap`` is set — a short replay of the last few logged messages.
+    * ``items`` — the ranked facts as a flat list of strings, for surfacing to the
+      client over the ``memory`` protocol frame (empty when there are none). The
+      recap is prompt-only and never appears here.
 
-    Both come from a single read so the facts the user *sees* and the facts the model
-    *gets* can never drift apart. Returns ``(None, [])`` when memory is disabled.
+    Facts and the recap come from one read so what the user *sees* and what the model
+    *gets* can't drift. ``include_recap`` is meant for a cold session start (empty
+    live history); a session with its own history already carries recent context, so
+    the caller leaves it off to avoid replaying turns the model already has. Returns
+    ``(None, [])`` when memory is disabled.
     """
     settings = settings or get_settings()
     if not settings.feature_memory:
@@ -110,6 +132,15 @@ async def build_memory_view(
     ranked = _rank_facts(facts, query, settings.memory_max_facts)
     block = _format_block(ranked, tasks)
     items = [f["content"] for f in ranked]
+
+    if include_recap and settings.recent_recap_messages > 0:
+        recent = await asyncio.to_thread(
+            store.recent_messages, settings.recent_recap_messages
+        )
+        recap = _format_recap(recent)
+        if recap:
+            block = f"{block}\n\n{recap}" if block else recap
+
     return block, items
 
 

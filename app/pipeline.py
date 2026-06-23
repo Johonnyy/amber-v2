@@ -36,6 +36,7 @@ from app.config import get_settings
 from app.memory import build_memory_view, remember
 from app.persona import compose_system_prompt
 from app.responder import respond
+from app.runtime_context import build_runtime_context
 from app.sentence_splitter import SentenceSplitter
 from app.session import Conversation
 from app.stt import transcribe
@@ -130,6 +131,11 @@ async def _think_and_speak(
     what the user actually heard.
     """
     settings = get_settings()
+    # A cold turn — the first of a fresh or reconnected session, before this user
+    # turn is recorded — has no live history yet, so the brain gets a "where you left
+    # off" recap from durable memory. Once the session has turns of its own they
+    # already carry recent context, so the recap is skipped to avoid replaying them.
+    cold_start = not conversation.messages
     conversation.add_user(transcript_text)
 
     # Phase 2: the brain. Fallback to the Phase-1 canned reply when the LLM is off
@@ -139,10 +145,15 @@ async def _think_and_speak(
         # prompt (the model's copy) and out to the client as a ``memory`` frame (the
         # user-visible copy), so the two can't drift. The frame is advisory; emitting
         # it before the reply streams lets a client show what Amber is drawing on.
-        memory_block, memory_items = await build_memory_view(transcript_text)
+        memory_block, memory_items = await build_memory_view(
+            transcript_text, include_recap=cold_start
+        )
         if memory_items:
             await send_json(protocol.memory(memory_items))
-        system = compose_system_prompt(memory_block)
+        # Ambient context (date/time) is rebuilt every turn and always injected,
+        # independent of the memory flag — Amber should always know when it is.
+        runtime_context = build_runtime_context()
+        system = compose_system_prompt(memory_block, runtime_context)
         tokens = think(conversation.messages, system=system, client_tools=client_tools)
     else:
         tokens = respond(transcript_text)

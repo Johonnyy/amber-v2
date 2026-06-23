@@ -43,7 +43,7 @@ async def test_memory_block_reaches_the_brain_system_prompt(fake_io, monkeypatch
         block = "What you remember about your user:\n- Has a dog named Mango"
         return block, ["Has a dog named Mango"]
 
-    async def fake_think(messages, system=None):
+    async def fake_think(messages, system=None, **kw):
         seen["system"] = system
         yield "Hello there."
 
@@ -67,13 +67,64 @@ async def test_memory_block_reaches_the_brain_system_prompt(fake_io, monkeypatch
     assert mem == [{"type": "memory", "items": ["Has a dog named Mango"]}]
 
 
+async def test_runtime_context_reaches_the_brain_system_prompt(fake_io, monkeypatch):
+    seen = {}
+
+    async def no_view(query=None, **kw):
+        return None, []
+
+    async def fake_think(messages, system=None, **kw):
+        seen["system"] = system
+        yield "Sure."
+
+    async def no_remember(user_text, reply, **kw):
+        return []
+
+    monkeypatch.setattr(pipeline, "build_memory_view", no_view)
+    monkeypatch.setattr(pipeline, "think", fake_think)
+    monkeypatch.setattr(pipeline, "remember", no_remember)
+
+    sink = FakeSink()
+    await pipeline.run_turn(b"audio", sink.send_json, sink.send_bytes, Conversation())
+
+    # The ambient date/time block is injected every turn, even with memory empty.
+    assert "Right now it's" in seen["system"]
+    assert "You are Amber" in seen["system"]  # persona still present
+
+
+async def test_recap_requested_only_on_a_cold_session_start(fake_io, monkeypatch):
+    recaps = []
+
+    async def spy_view(query=None, *, include_recap=False, **kw):
+        recaps.append(include_recap)
+        return None, []
+
+    async def fake_think(messages, system=None, **kw):
+        yield "Okay."
+
+    async def no_remember(user_text, reply, **kw):
+        return []
+
+    monkeypatch.setattr(pipeline, "build_memory_view", spy_view)
+    monkeypatch.setattr(pipeline, "think", fake_think)
+    monkeypatch.setattr(pipeline, "remember", no_remember)
+
+    conv = Conversation()
+    sink = FakeSink()
+    await pipeline.run_turn(b"a", sink.send_json, sink.send_bytes, conv)
+    await pipeline.run_turn(b"b", sink.send_json, sink.send_bytes, conv)
+
+    # First turn (empty history) asks for the recap; the second (warm) does not.
+    assert recaps == [True, False]
+
+
 async def test_writer_called_with_exchange_after_turn(fake_io, monkeypatch):
     calls = []
 
     async def no_context(query=None, **kw):
         return None, []
 
-    async def fake_think(messages, system=None):
+    async def fake_think(messages, system=None, **kw):
         yield "Nice, Mango sounds lovely."
 
     async def spy_remember(user_text, reply, **kw):
@@ -94,7 +145,7 @@ async def test_writer_failure_does_not_break_the_turn(fake_io, monkeypatch):
     async def no_context(query=None, **kw):
         return None, []
 
-    async def fake_think(messages, system=None):
+    async def fake_think(messages, system=None, **kw):
         yield "All good."
 
     async def boom_remember(user_text, reply, **kw):

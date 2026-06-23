@@ -3,7 +3,7 @@
 import pytest
 
 from app.config import Settings
-from app.memory.context import _rank_facts, build_context
+from app.memory.context import _rank_facts, build_context, build_memory_view
 from app.memory.store import MemoryStore
 
 
@@ -13,7 +13,7 @@ def _facts(*contents):
 
 
 def _settings(**over):
-    base = dict(feature_memory=True, memory_max_facts=12)
+    base = dict(feature_memory=True, memory_max_facts=12, recent_recap_messages=6)
     base.update(over)
     return Settings(_env_file=None, **base)
 
@@ -88,3 +88,49 @@ async def test_build_context_caps_facts(store):
     # Only the cap's worth of fact bullets appear.
     fact_lines = [ln for ln in block.splitlines() if ln.startswith("- ")]
     assert len(fact_lines) == 3
+
+
+# --- recent-conversation recap (cold-start continuity) ---
+
+async def test_recap_replays_recent_messages_when_requested(store):
+    store.log_exchange("Remind me to call mom", "Sure, I'll remind you.")
+
+    block, items = await build_memory_view(
+        "anything", include_recap=True, store=store, settings=_settings()
+    )
+
+    assert block is not None
+    assert "Picking up from your last conversation" in block
+    assert "They: Remind me to call mom" in block
+    assert "You: Sure, I'll remind you." in block
+    # The recap is prompt-only — it never leaks into the client memory items.
+    assert items == []
+
+
+async def test_recap_omitted_by_default(store):
+    store.log_exchange("hello", "hi there")
+    block, _ = await build_memory_view("anything", store=store, settings=_settings())
+    # No include_recap -> no replay (the live history already covers recent context).
+    assert block is None
+
+
+async def test_recap_disabled_by_zero_cap(store):
+    store.log_exchange("hello", "hi there")
+    block, _ = await build_memory_view(
+        "anything",
+        include_recap=True,
+        store=store,
+        settings=_settings(recent_recap_messages=0),
+    )
+    assert block is None
+
+
+async def test_recap_appends_after_facts(store):
+    store.add_fact("Likes hiking")
+    store.log_exchange("what's the weather", "Looks clear today.")
+
+    block, _ = await build_memory_view(
+        "hiking", include_recap=True, store=store, settings=_settings()
+    )
+    # Facts come first, the recap after.
+    assert block.index("Likes hiking") < block.index("Picking up from")

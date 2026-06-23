@@ -102,10 +102,18 @@ Key modules: `app/config.py` (all models/keys/flags), `app/protocol.py` (WS wire
 contract), `app/sentence_splitter.py` (streaming seam), `app/pipeline.py` (the voice
 loop), `app/main.py` (FastAPI + `/ws`). The "brain" is `app/brain.py` (streamed
 Claude Haiku) with its personality in `app/persona.py` (`compose_system_prompt`
-appends the memory block); `app/session.py` holds per-connection conversation
+layers the per-turn context blocks onto the persona: the runtime context first,
+then the memory block); `app/session.py` holds per-connection conversation
 history. `app/responder.py` is the canned fallback used when `AMBER_FEATURE_LLM=
 false`. Both speak the same `AsyncIterator[str]` contract, so the pipeline
 downstream of the brain is unchanged.
+
+Per-turn context. Every system prompt is the static persona plus two fresh blocks
+the pipeline builds each turn, so the brain always knows "when it is" and "what it
+knows": `app/runtime_context.py` (`build_runtime_context`) is a one-line date/time
+stamp read in `AMBER_TIMEZONE` (unknown zone → UTC) — *always* injected, independent
+of the memory flag; and the memory block below. The conversation history downstream
+supplies "what was just said".
 
 Persistent memory (Phase 3) lives in the `app/memory/` package: `store.py` (SQLite
 `facts`/`conversations`/`tasks`/`reminders` tables + sync CRUD, `get_store()`),
@@ -113,7 +121,12 @@ Persistent memory (Phase 3) lives in the `app/memory/` package: `store.py` (SQLi
 the turn is spoken), and `context.py` (`build_memory_view` — rank relevant facts in
 one store pass into both a compressed prompt *block* for the system prompt and a
 flat list of *items* for client display; `build_context` is the block-only
-wrapper). Gated by `AMBER_FEATURE_MEMORY`; the read half runs inline before the
+wrapper). On a *cold* turn (the first of a fresh/reconnected session, empty live
+history) the pipeline passes `include_recap=True` so `build_memory_view` appends a
+short "where you left off" replay of the last `AMBER_RECENT_RECAP_MESSAGES` durable
+messages — cross-session continuity the live history can't give yet; warm turns skip
+it (history already carries recent context) and the recap is prompt-only (never in
+`items`). Gated by `AMBER_FEATURE_MEMORY`; the read half runs inline before the
 brain — injecting the block into the prompt *and* emitting an additive `memory`
 protocol frame (the same facts, advisory, for the client's memory panel) — and the
 write half runs off the latency path after `turn_complete`. Memory is *persistent

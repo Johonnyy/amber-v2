@@ -38,6 +38,10 @@ class Settings(BaseSettings):
     host: str = "0.0.0.0"
     port: int = 8000
     log_level: str = "INFO"
+    # IANA timezone the brain's clock is read in (e.g. "America/New_York"). Drives
+    # the date/time line injected into every system prompt (app/runtime_context.py).
+    # An unknown/unavailable zone degrades to UTC rather than failing a turn.
+    timezone: str = "UTC"
 
     # --- Models (swappable) ---
     stt_model: str = "whisper-1"
@@ -65,6 +69,12 @@ class Settings(BaseSettings):
     # Hard cap on new facts kept from a single exchange, so one turn can't flood
     # the store.
     memory_max_new_facts: int = 5
+    # On a *cold* turn (the first of a fresh/reconnected session, when the live
+    # in-memory history is empty), how many of the most recent durable messages to
+    # replay into the prompt as a "where you left off" recap — cross-session
+    # continuity the live history can't provide yet. Skipped once the session has
+    # its own history (which already covers recent context). 0 disables the recap.
+    recent_recap_messages: int = 6
 
     # --- Tools (Phase 4) ---
     # Max tool-use round trips the brain will make in one turn before it must

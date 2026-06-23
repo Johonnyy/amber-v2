@@ -50,13 +50,26 @@ briefly and honestly rather than pretending.
 """
 
 
-def compose_system_prompt(memory_block: str | None = None) -> str:
-    """Persona prompt with the memory block appended, if there is one.
+def compose_system_prompt(
+    memory_block: str | None = None,
+    runtime_context: str | None = None,
+) -> str:
+    """Persona prompt with the per-turn context blocks appended.
 
-    The memory block is built per turn by `app.memory.build_context`. When it's
-    ``None`` (memory off, or nothing relevant) the bare persona prompt is returned
-    unchanged, so Phase-2 behavior is exactly preserved.
+    Two optional blocks are layered onto the static persona, in order:
+
+    * ``runtime_context`` — the ambient "right now" (date/time) from
+      `app.runtime_context.build_runtime_context`. Always fresh, always on.
+    * ``memory_block`` — durable knowledge about the user from
+      `app.memory.build_context`. ``None`` when memory is off or nothing's relevant.
+
+    With neither block the bare persona prompt is returned unchanged, so the
+    Phase-2 contract is exactly preserved. Runtime context comes first (the "now"),
+    then memory (the "what I know"), then the conversation history downstream.
     """
-    if not memory_block:
-        return SYSTEM_PROMPT
-    return f"{SYSTEM_PROMPT}\n\n{memory_block}"
+    parts = [SYSTEM_PROMPT]
+    if runtime_context:
+        parts.append(runtime_context)
+    if memory_block:
+        parts.append(memory_block)
+    return "\n\n".join(parts)
