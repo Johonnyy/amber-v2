@@ -18,8 +18,11 @@
 #
 set -euo pipefail
 
-APP_DIR="/opt/amber"
-APP_USER="amber"
+# App location + the user that owns/runs it. Auto-derived so this works whatever
+# the deploy user is (amber, ubuntu, …): APP_DIR is this script's repo root, and
+# APP_USER is whoever owns it. Override either with AMBER_APP_DIR / AMBER_APP_USER.
+APP_DIR="${AMBER_APP_DIR:-"$(cd "$(dirname "$0")/.." && pwd)"}"
+APP_USER="${AMBER_APP_USER:-"$(stat -c '%U' "$APP_DIR")"}"
 ENV_FILE="$APP_DIR/.env"
 EXAMPLE="$APP_DIR/.env.example"
 SERVICE_SRC="$APP_DIR/deploy/amber.service"
@@ -202,15 +205,35 @@ chmod 600 "$ENV_FILE"
 [ "$missing_required" -eq 0 ] || die "required secrets are still unset in $ENV_FILE — fill them and re-run"
 
 # --- 5. systemd unit ---------------------------------------------------------
-# Reinstall whenever the installed unit differs from the repo's — covers both a
-# changed unit in this pull and manual drift on the box.
+# Render the repo's unit for THIS deploy (substituting the real user + app path),
+# then install it only when there isn't one yet. If an existing unit differs we do
+# NOT overwrite it: a hand-customized unit (different User, relaxed hardening for
+# self-update, etc.) must win over the template — silently reverting it is how a
+# working box gets re-broken. Force adopting the template with AMBER_FORCE_UNIT=1.
 [ -f "$SERVICE_SRC" ] || die "missing $SERVICE_SRC — is the repo complete?"
-if ! cmp -s "$SERVICE_SRC" "$SERVICE_DST"; then
-  step "Updating systemd unit"
-  install -m 644 "$SERVICE_SRC" "$SERVICE_DST"
+rendered="$(mktemp)"
+sed -e "s|^User=.*|User=$APP_USER|" \
+    -e "s|^Group=.*|Group=$APP_USER|" \
+    -e "s|/opt/amber|$APP_DIR|g" \
+    "$SERVICE_SRC" > "$rendered"
+
+if [ ! -f "$SERVICE_DST" ]; then
+  step "Installing systemd unit (user $APP_USER)"
+  install -m 644 "$rendered" "$SERVICE_DST"
   systemctl daemon-reload
-  ok "unit reinstalled + daemon reloaded"
+  ok "unit installed + daemon reloaded"
+elif ! cmp -s "$rendered" "$SERVICE_DST"; then
+  if [ "${AMBER_FORCE_UNIT:-0}" = "1" ]; then
+    step "Updating systemd unit (forced)"
+    install -m 644 "$rendered" "$SERVICE_DST"
+    systemctl daemon-reload
+    ok "unit reinstalled + daemon reloaded"
+  else
+    warn "installed unit differs from the repo template — leaving it untouched"
+    warn "  (looks customized for this box; adopt the template with AMBER_FORCE_UNIT=1)"
+  fi
 fi
+rm -f "$rendered"
 
 # --- 6. restart + verify -----------------------------------------------------
 step "Restarting Amber"

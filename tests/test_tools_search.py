@@ -128,3 +128,45 @@ async def test_http_error_degrades_gracefully(monkeypatch):
 
     out = await search.web_search("anything")
     assert "unavailable" in out.lower()
+
+
+# --- native ("anthropic") server-side provider ---------------------------------
+
+
+async def test_native_provider_exposes_server_tool(monkeypatch):
+    monkeypatch.setattr(
+        search,
+        "get_settings",
+        lambda: _settings(
+            search_provider="anthropic",
+            search_tool_version="web_search_20250305",
+            search_max_uses=4,
+        ),
+    )
+    assert search.server_tool_schemas() == [
+        {"type": "web_search_20250305", "name": "web_search", "max_uses": 4}
+    ]
+    # ...and the inline tool is hidden so it can't collide with the native one.
+    assert search._inline_search_available() is False
+
+
+async def test_native_provider_inline_call_is_guarded(monkeypatch):
+    # The inline function is unreachable via dispatch (hidden), but guard it anyway:
+    # it must never fall through to the keyless DuckDuckGo path.
+    def boom(*a, **k):
+        raise AssertionError("native provider must not make an HTTP call")
+
+    monkeypatch.setattr(search.httpx, "AsyncClient", boom)
+    monkeypatch.setattr(
+        search, "get_settings", lambda: _settings(search_provider="anthropic")
+    )
+    out = await search.web_search("who won the world cup")
+    assert "Native web search" in out
+
+
+async def test_self_dispatched_provider_has_no_server_tool(monkeypatch):
+    monkeypatch.setattr(
+        search, "get_settings", lambda: _settings(search_provider="duckduckgo")
+    )
+    assert search.server_tool_schemas() == []
+    assert search._inline_search_available() is True

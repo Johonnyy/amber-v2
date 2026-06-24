@@ -60,6 +60,12 @@ class _FakeClient:
         self.messages = _FakeMessages(streams)
 
 
+@pytest.fixture(autouse=True)
+def _no_server_tools(monkeypatch):
+    """Default Anthropic's native server-side tools off; tests opt in explicitly."""
+    monkeypatch.setattr(brain, "get_server_tool_schemas", lambda: [])
+
+
 async def _collect(messages, system=None):
     return [t async for t in brain.think(messages, system=system)]
 
@@ -116,6 +122,45 @@ async def test_tool_loop_executes_then_answers(monkeypatch):
     assert tool_result["content"][0]["type"] == "tool_result"
     assert tool_result["content"][0]["tool_use_id"] == "t1"
     assert tool_result["content"][0]["content"] == "result: 42"
+
+
+async def test_server_tool_offered_and_pause_turn_resumes(monkeypatch):
+    """Native web search is a server tool: offered on the request, never dispatched.
+    A ``pause_turn`` echoes the partial assistant turn back so the server resumes."""
+    native = {"type": "web_search_20250305", "name": "web_search", "max_uses": 5}
+    streams = [
+        # The server runs the search, streams some text, and pauses the turn.
+        _FakeStream(
+            ["Looking that up. "],
+            _FinalMessage([_Block("text", text="Looking that up. ")], "pause_turn"),
+        ),
+        # Resumed: the model finishes the answer with what it found.
+        _FakeStream(
+            ["The final is on Sunday."],
+            _FinalMessage([_Block("text", text="The final is on Sunday.")], "end_turn"),
+        ),
+    ]
+    client = _FakeClient(streams)
+    monkeypatch.setattr(brain, "get_client", lambda: client)
+    monkeypatch.setattr(brain, "get_tool_schemas", lambda: [])
+    monkeypatch.setattr(brain, "get_server_tool_schemas", lambda: [native])
+
+    # A tool dispatch here would be a bug — server tools run on Anthropic's side.
+    async def boom(name, tool_input):
+        raise AssertionError("server tools must not be dispatched locally")
+
+    monkeypatch.setattr(brain, "run_tool", boom)
+
+    out = await _collect([{"role": "user", "content": "when's the final?"}])
+    assert "".join(out) == "Looking that up. The final is on Sunday."
+
+    # The native tool was offered on the request...
+    assert client.messages.calls[0]["tools"] == [native]
+    # ...and the pause echoed the partial assistant turn straight back (no tool_result).
+    assert len(client.messages.calls) == 2
+    resumed = client.messages.calls[1]["messages"]
+    assert resumed[-1]["role"] == "assistant"
+    assert resumed[-1]["content"][0].text == "Looking that up. "
 
 
 async def test_caller_history_not_mutated(monkeypatch):

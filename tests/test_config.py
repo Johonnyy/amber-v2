@@ -31,7 +31,10 @@ def test_env_overrides(monkeypatch):
 def test_tool_defaults():
     s = _fresh()
     assert s.feature_tools is True
-    assert s.search_provider == "duckduckgo"
+    # Native server-side web search is the default (reliable for current events).
+    assert s.search_provider == "anthropic"
+    assert s.search_tool_version == "web_search_20250305"
+    assert s.search_max_uses == 5
     assert s.openclaw_url == ""  # bridge disabled until configured
     assert s.max_tool_iterations == 5
 

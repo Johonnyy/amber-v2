@@ -139,15 +139,30 @@ decorates a Python function (sync or async) returning a result string; `schemas(
 exports the Anthropic `tools=[...]` list and `dispatch()` runs a call, converting
 any error into a string so a bad tool never crashes a turn. A tool may carry an
 `available()` predicate — unavailable tools are hidden and refuse to run. Inline
-tools: `search.py` (`web_search`; provider `duckduckgo` keyless / `tavily`),
-`tasks.py` (`add_task`/`list_tasks`/`complete_task` over the store), `reminders.py`
-(`set_reminder` — persists to the `reminders` table; firing/delivery is future
-work). The OpenClaw bridge is `openclaw.py` (`delegate_to_openclaw` — POSTs a
-natural-language task to `AMBER_OPENCLAW_URL` with a bearer `AMBER_OPENCLAW_TOKEN`
-and blocks for the result; only offered when a URL is set). The agentic loop —
-stream → `tool_use` → execute → feed results back → repeat to `max_tool_iterations`
-— lives in `app/brain.py`; it works on a copy of the history so only spoken text is
-recorded, leaving everything downstream of the brain unchanged.
+tools: `search.py`, `tasks.py` (`add_task`/`list_tasks`/`complete_task` over the
+store), `reminders.py` (`set_reminder` — persists to the `reminders` table;
+firing/delivery is future work). The OpenClaw bridge is `openclaw.py`
+(`delegate_to_openclaw` — POSTs a natural-language task to `AMBER_OPENCLAW_URL` with
+a bearer `AMBER_OPENCLAW_TOKEN` and blocks for the result; only offered when a URL
+is set).
+
+Web search has two shapes, by `AMBER_SEARCH_PROVIDER` (`app/tools/search.py`). The
+**default `anthropic`** is Anthropic's *native server-side* web search — not an HTTP
+call Amber makes but a **server tool** the model runs itself: `server_tool_schemas()`
+(re-exported as `app.tools.get_server_tool_schemas`) hands the brain a
+`{"type": AMBER_SEARCH_TOOL_VERSION, "name": "web_search", "max_uses": …}` block,
+Anthropic executes the search inside the LLM request, and the answer streams back
+with citations. Reliable for live/current-events queries the keyless API can't
+reach; billed per search. The self-dispatched fallbacks (`tavily` keyed, `duckduckgo`
+keyless) are the old inline `web_search` registry tool, which is *hidden* under the
+native provider (shared name `web_search` — the API rejects duplicates).
+
+The agentic loop — stream → `tool_use` → execute → feed results back → repeat to
+`max_tool_iterations` — lives in `app/brain.py`; it works on a copy of the history
+so only spoken text is recorded, leaving everything downstream of the brain
+unchanged. Server tools aren't dispatched (Anthropic runs them); when one runs long
+the API ends a turn with `pause_turn`, and the loop echoes the partial assistant
+turn back to let the server resume.
 
 Reliability (Phase 5) is concentrated in the transport layer. `app/session.py` now
 holds, besides `Conversation` (the per-turn history, capped by `max_history_turns`),

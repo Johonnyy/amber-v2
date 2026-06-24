@@ -28,8 +28,18 @@ from app.tools.registry import Tool, ToolRegistry, registry
 
 
 def get_tool_schemas() -> list[dict[str, Any]]:
-    """Anthropic-format schemas for every currently-available tool."""
+    """Anthropic-format schemas for every currently-available tool Amber dispatches."""
     return registry.schemas()
+
+
+def get_server_tool_schemas() -> list[dict[str, Any]]:
+    """Schemas for Anthropic-executed *server* tools (e.g. native web search).
+
+    Added to the brain's ``tools=[...]`` list but never dispatched here — Anthropic
+    runs them server-side and streams the results back inline. See
+    :func:`app.tools.search.server_tool_schemas`.
+    """
+    return search.server_tool_schemas()
 
 
 async def run_tool(name: str, tool_input: dict[str, Any] | None) -> str:
@@ -42,5 +52,6 @@ __all__ = [
     "Tool",
     "ToolRegistry",
     "get_tool_schemas",
+    "get_server_tool_schemas",
     "run_tool",
 ]

@@ -20,6 +20,13 @@ model answers in plain text or the iteration cap is hit. Any text the model spea
 along the way (e.g. "let me check that") streams through the same seam, so tool use
 is invisible to everything downstream of the brain. The caller's history is never
 mutated with tool plumbing — only the spoken text is recorded by the pipeline.
+
+Tools come in two flavors. *Client/registry* tools we dispatch ourselves (stop
+reason ``tool_use``). *Server* tools (e.g. Anthropic's native web search) run on
+Anthropic's infrastructure inside the same request — nothing to dispatch; the model
+just streams the searched answer back. If a server tool runs long the API may end a
+turn with ``pause_turn``; the loop echoes the partial assistant turn back so the
+server resumes, otherwise behaving exactly as before.
 """
 
 from __future__ import annotations
@@ -33,7 +40,7 @@ from anthropic import AsyncAnthropic
 
 from app.config import Settings, get_settings
 from app.persona import SYSTEM_PROMPT
-from app.tools import get_tool_schemas, run_tool
+from app.tools import get_server_tool_schemas, get_tool_schemas, run_tool
 
 if TYPE_CHECKING:
     from app.client_tools import ClientTools
@@ -79,6 +86,9 @@ async def think(
     tools: list[dict] = []
     if settings.feature_tools:
         tools += get_tool_schemas()
+        # Native server-side tools (e.g. Anthropic's web search) — added to the
+        # request but run by Anthropic, never dispatched by us.
+        tools += get_server_tool_schemas()
     if settings.feature_client_tools and client_tools is not None:
         tools += client_tools.schemas()
 
@@ -109,15 +119,21 @@ async def think(
                 yield text
             final = await stream.get_final_message()
 
-        if final.stop_reason != "tool_use":
+        if final.stop_reason == "tool_use":
+            # The model called a tool we dispatch (Amber's own or a client tool):
+            # record its turn (text + tool_use), run the calls, and hand the results
+            # back for the next iteration.
+            working.append({"role": "assistant", "content": final.content})
+            working.append(
+                {"role": "user", "content": await _run_tool_calls(final.content, dispatch)}
+            )
+        elif final.stop_reason == "pause_turn":
+            # A *server* tool (e.g. native web search) ran long enough that Anthropic
+            # paused the turn. Echo the partial assistant turn straight back so the
+            # server resumes its own loop — there is nothing for us to dispatch.
+            working.append({"role": "assistant", "content": final.content})
+        else:
             return
-
-        # The model wants tools: record its turn (text + tool_use), run the calls,
-        # and hand the results back for the next iteration.
-        working.append({"role": "assistant", "content": final.content})
-        working.append(
-            {"role": "user", "content": await _run_tool_calls(final.content, dispatch)}
-        )
 
     # Iteration cap hit while still calling tools. Force a final answer with tools
     # off, so the user always hears a reply built from whatever was gathered.

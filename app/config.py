@@ -80,13 +80,30 @@ class Settings(BaseSettings):
     # Max tool-use round trips the brain will make in one turn before it must
     # answer with what it has. A backstop against a model that loops on tools.
     max_tool_iterations: int = 5
-    # Web search (inline tool). Provider selects the backend:
-    #   "duckduckgo" — keyless Instant Answer API (default; quick factual lookups)
-    #   "tavily"     — LLM-oriented search; requires search_api_key.
-    search_provider: str = "duckduckgo"
+    # Web search. The provider selects the backend:
+    #   "anthropic"  — Anthropic's *native server-side* web search tool (default).
+    #                  Anthropic runs the search on its own infrastructure inside the
+    #                  LLM request and streams the answer back with citations — far
+    #                  more reliable than scraping, and the only key it needs is the
+    #                  Anthropic key the brain already uses. Billed per search
+    #                  (~$10 / 1000) on top of tokens.
+    #   "tavily"     — LLM-oriented search API Amber calls itself; needs
+    #                  search_api_key. A self-dispatched fallback.
+    #   "duckduckgo" — keyless Instant Answer API Amber calls itself. Returns only
+    #                  canned "instant answers" (no real web crawl), so it misses
+    #                  most current-events queries — kept only as a no-key fallback.
+    # The native provider is a *server tool* the model runs itself; the other two are
+    # ordinary inline tools Amber dispatches. When "anthropic" is selected the inline
+    # web_search tool is hidden, since the native one supersedes it (same name).
+    search_provider: str = "anthropic"
     search_api_key: str = ""
-    # Hard cap on result snippets folded into one tool result (kept small — the
-    # model pays for them in tokens, and voice answers are short).
+    # Native ("anthropic") provider: the dated server-tool type, and the max searches
+    # the model may run in a single turn. Bump the version to adopt a newer web-search
+    # tool without touching code.
+    search_tool_version: str = "web_search_20250305"
+    search_max_uses: int = 5
+    # Self-dispatched providers (tavily/duckduckgo): hard cap on result snippets
+    # folded into one tool result (kept small — the model pays for them in tokens).
     search_max_results: int = 3
     search_timeout_s: float = 10.0
     # OpenClaw bridge — heavy/delegated work over HTTP to the separate OpenClaw
