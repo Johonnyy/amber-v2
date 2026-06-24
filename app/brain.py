@@ -115,7 +115,7 @@ async def think(
             messages=working,
             tools=tools,
         ) as stream:
-            async for text in stream.text_stream:
+            async for text in _yield_text(stream):
                 yield text
             final = await stream.get_final_message()
 
@@ -158,8 +158,37 @@ async def _stream_once(
         system=system,
         messages=messages,
     ) as stream:
-        async for text in stream.text_stream:
+        async for text in _yield_text(stream):
             yield text
+
+
+async def _yield_text(stream) -> AsyncIterator[str]:
+    """Yield text deltas from a live stream, plus a newline at each tool boundary.
+
+    The newline is a *flush hint* for the downstream sentence splitter. When the
+    model stops speaking to call a tool — its own ``tool_use`` or a server tool like
+    Anthropic's native web search (``server_tool_use``) — whatever it said first is a
+    complete spoken unit and should reach TTS *before* the tool runs. Otherwise the
+    splitter holds that last sentence waiting for trailing whitespace that won't
+    arrive until the tool returns, which for web search can be several seconds: the
+    user hears dead air, then the preamble and the answer at once. Emitting "\\n" the
+    moment the tool block starts lets "Let me check that" play while the search runs.
+
+    Text is yielded only on the high-level ``text`` event so each delta is emitted
+    once — the SDK also fires a raw ``content_block_delta`` for the same text, and
+    consuming both would double every token.
+    """
+    spoke = False
+    async for event in stream:
+        etype = getattr(event, "type", None)
+        if etype == "text":
+            spoke = True
+            yield event.text
+        elif etype == "content_block_start":
+            block_type = getattr(getattr(event, "content_block", None), "type", None)
+            if spoke and block_type in ("tool_use", "server_tool_use"):
+                yield "\n"
+                spoke = False
 
 
 def _make_dispatch(client_tools: "ClientTools | None") -> ToolDispatch:

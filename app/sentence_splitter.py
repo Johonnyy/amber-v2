@@ -70,11 +70,20 @@ class SentenceSplitter:
     def _find_boundary(self) -> int | None:
         """Return the index *after* the first sentence end, or None if incomplete.
 
-        A boundary is a terminator (optionally trailed by closing quotes) that is
-        followed by whitespace. We require trailing whitespace so we never split a
-        sentence whose final punctuation is still mid-stream (e.g. "3." of "3.14").
+        Two things end a spoken unit:
+
+        * a newline — a hard break. The brain injects one when the model stops
+          speaking to call a tool, so the spoken preamble ("let me check that")
+          reaches TTS *before* the tool, possibly seconds, runs instead of being
+          held back until after it returns.
+        * a terminator (``. ! ?``), optionally trailed by closing quotes, that is
+          followed by whitespace. We require the trailing whitespace so we never
+          split a sentence whose final punctuation is still mid-stream (e.g. the
+          "3." of "3.14").
         """
         for i, ch in enumerate(self._buf):
+            if ch == "\n":
+                return i + 1
             if ch not in _TERMINATORS:
                 continue
             end = i + 1

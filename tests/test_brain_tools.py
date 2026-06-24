@@ -14,6 +14,20 @@ class _Block:
             setattr(self, k, v)
 
 
+class _Ev:
+    """A streaming event: a ``.type`` plus whatever attributes that type carries."""
+
+    def __init__(self, type, **kw):
+        self.type = type
+        for k, v in kw.items():
+            setattr(self, k, v)
+
+
+def _starts(block_type):
+    """A ``content_block_start`` event for a block of the given type (e.g. a tool)."""
+    return _Ev("content_block_start", content_block=_Block(block_type))
+
+
 class _FinalMessage:
     def __init__(self, content, stop_reason):
         self.content = content
@@ -21,7 +35,13 @@ class _FinalMessage:
 
 
 class _FakeStream:
-    """One `messages.stream(...)` context: streams chunks, then a final message."""
+    """One `messages.stream(...)` context: yields events, then a final message.
+
+    The brain consumes the stream event by event (`async for event in stream`).
+    Items in ``chunks`` are either plain strings — shorthand for a ``text`` delta
+    event — or pre-built event objects (e.g. a ``content_block_start`` via
+    :func:`_starts`), so a test can interleave a tool-block start with text deltas.
+    """
 
     def __init__(self, chunks, final):
         self._chunks = chunks
@@ -33,11 +53,10 @@ class _FakeStream:
     async def __aexit__(self, *exc):
         return False
 
-    @property
-    def text_stream(self):
+    def __aiter__(self):
         async def gen():
             for c in self._chunks:
-                yield c
+                yield _Ev("text", text=c) if isinstance(c, str) else c
 
         return gen()
 
@@ -122,6 +141,36 @@ async def test_tool_loop_executes_then_answers(monkeypatch):
     assert tool_result["content"][0]["type"] == "tool_result"
     assert tool_result["content"][0]["tool_use_id"] == "t1"
     assert tool_result["content"][0]["content"] == "result: 42"
+
+
+async def test_preamble_flushes_before_server_tool(monkeypatch):
+    """When the model stops speaking to run a server tool (native web search), a
+    newline is emitted right then — the flush hint that lets the spoken preamble
+    reach TTS *before* the search runs, instead of being bundled with the answer."""
+    native = {"type": "web_search_20250305", "name": "web_search", "max_uses": 5}
+    final = _FinalMessage(
+        [
+            _Block("text", text="Let me check that."),
+            _Block("server_tool_use", id="s1", name="web_search", input={"query": "x"}),
+            _Block("web_search_tool_result", tool_use_id="s1", content=[]),
+            _Block("text", text="It's on Sunday."),
+        ],
+        "end_turn",
+    )
+    # The preamble streams, then the search block starts, then the answer streams.
+    stream = _FakeStream(
+        ["Let me check that.", _starts("server_tool_use"), "It's on Sunday."],
+        final,
+    )
+    client = _FakeClient([stream])
+    monkeypatch.setattr(brain, "get_client", lambda: client)
+    monkeypatch.setattr(brain, "get_tool_schemas", lambda: [])
+    monkeypatch.setattr(brain, "get_server_tool_schemas", lambda: [native])
+
+    out = await _collect([{"role": "user", "content": "when's the final?"}])
+    # The "\n" lands between preamble and answer; a text-only block start gets none.
+    assert out == ["Let me check that.", "\n", "It's on Sunday."]
+    assert client.messages.calls[0]["tools"] == [native]
 
 
 async def test_server_tool_offered_and_pause_turn_resumes(monkeypatch):
