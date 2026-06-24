@@ -164,6 +164,25 @@ unchanged. Server tools aren't dispatched (Anthropic runs them); when one runs l
 the API ends a turn with `pause_turn`, and the loop echoes the partial assistant
 turn back to let the server resume.
 
+Turn-based conversations (gated by `AMBER_FEATURE_TURN_BASED`) let Amber hold a
+turn open when it genuinely expects an answer — *only when necessary*, never every
+turn. The brain advertises an `expect_reply` tool (`app/brain.py`, `EXPECT_REPLY_TOOL`)
+whose dispatch is *intercepted* (never routed to the registry): calling it flips
+`awaiting_response` on the per-turn `TurnSignals` back-channel (`app/turn_signals.py`)
+the pipeline threads into `think(..., signals=)`, mirroring how `client_tools` is
+threaded. The brain still yields only text. The pipeline reads the flag after the
+stream and sets it on the `turn_complete` frame (additive optional
+`awaiting_response`, key present only when true — `app/protocol.py`); the client
+keeps the mic open and the next utterance continues the conversation. Continuation
+itself needs no server state — the per-connection history already chains turns —
+so nothing is stored on the `Session`. Persona guidance (`app/persona.py`) tells
+Amber when to call it. Recent-conversation awareness across sessions has two pieces:
+the cold-start recap depth (`recent_recap_messages`, now 8) and an on-demand
+`recall_recent` tool (`app/tools/recall.py`, gated by `feature_memory`) the model
+calls when the user refers back to an earlier talk — reading the last
+`recall_messages` rows from the durable `conversations` table, so later turns of a
+fresh session can still reach past context without per-turn token cost.
+
 Reliability (Phase 5) is concentrated in the transport layer. `app/session.py` now
 holds, besides `Conversation` (the per-turn history, capped by `max_history_turns`),
 a `Session` (stable id + retained conversation + per-session limiter) and a

@@ -44,11 +44,30 @@ from app.tools import get_server_tool_schemas, get_tool_schemas, run_tool
 
 if TYPE_CHECKING:
     from app.client_tools import ClientTools
+    from app.turn_signals import TurnSignals
 
 logger = logging.getLogger(__name__)
 
 # A tool dispatcher: (name, input) -> the string result fed back to the model.
 ToolDispatch = Callable[[str, dict], Awaitable[str]]
+
+# Turn-based conversations: a signaling tool the model calls to keep a turn open.
+# Its schema is advertised like any other tool, but its dispatch is intercepted
+# (never routed to the registry) — calling it just flips a flag on the turn's
+# TurnSignals so the pipeline tells the client to keep listening.
+EXPECT_REPLY_TOOL = "expect_reply"
+_EXPECT_REPLY_SCHEMA: dict = {
+    "name": EXPECT_REPLY_TOOL,
+    "description": (
+        "Signal that you're waiting for the user's answer and the conversation "
+        "should stay open for their reply. Call this ONLY when you genuinely need "
+        "them to respond — a real clarifying question, or a back-and-forth you're "
+        "steering. Never for rhetorical questions, asides, or ordinary replies; "
+        "most turns just end. Speak your question as normal text; this only keeps "
+        "the mic open for their answer."
+    ),
+    "input_schema": {"type": "object", "properties": {}},
+}
 
 
 @lru_cache
@@ -63,6 +82,7 @@ async def think(
     system: str | None = None,
     *,
     client_tools: "ClientTools | None" = None,
+    signals: "TurnSignals | None" = None,
 ) -> AsyncIterator[str]:
     """Stream Amber's reply for the given conversation history.
 
@@ -78,6 +98,12 @@ async def think(
     (Phase 4+) is the connection's :class:`app.client_tools.ClientTools`: its
     declared tools are offered alongside Amber's own, and any ``client_*`` call is
     dispatched back over the WebSocket instead of through the server registry.
+
+    ``signals`` is the per-turn :class:`app.turn_signals.TurnSignals` back-channel
+    (turn-based conversations). When present and the feature is on, the model is
+    offered the ``expect_reply`` tool; calling it flips ``signals.awaiting_response``
+    (intercepted in dispatch, never routed to the registry) so the pipeline can keep
+    the turn open. The yielded text contract is unchanged either way.
     """
     settings = get_settings()
     client = get_client()
@@ -91,8 +117,11 @@ async def think(
         tools += get_server_tool_schemas()
     if settings.feature_client_tools and client_tools is not None:
         tools += client_tools.schemas()
+    if settings.feature_turn_based and signals is not None:
+        # Advertised like any tool, but dispatched specially (see _make_dispatch).
+        tools.append(_EXPECT_REPLY_SCHEMA)
 
-    dispatch = _make_dispatch(client_tools)
+    dispatch = _make_dispatch(client_tools, signals)
 
     if not tools:
         # No tools (flag off or none registered): the Phase-2/3 streaming path,
@@ -191,15 +220,23 @@ async def _yield_text(stream) -> AsyncIterator[str]:
                 spoke = False
 
 
-def _make_dispatch(client_tools: "ClientTools | None") -> ToolDispatch:
+def _make_dispatch(
+    client_tools: "ClientTools | None", signals: "TurnSignals | None" = None
+) -> ToolDispatch:
     """Build the per-turn tool dispatcher.
 
-    Client-declared (``client_*``) tools are routed back to the connecting client;
-    everything else goes through Amber's own process-wide registry. Both honor the
-    "never raise into the brain" contract — failures come back as strings.
+    The signaling ``expect_reply`` tool is intercepted first: it isn't a real
+    tool, just a flag on the turn's ``signals``, so it returns a short ack and the
+    loop continues (the model still speaks its question). Client-declared
+    (``client_*``) tools are then routed back to the connecting client; everything
+    else goes through Amber's own process-wide registry. All honor the "never raise
+    into the brain" contract — failures come back as strings.
     """
 
     async def dispatch(name: str, tool_input: dict) -> str:
+        if signals is not None and name == EXPECT_REPLY_TOOL:
+            signals.awaiting_response = True
+            return "OK — I'll wait for their reply."
         if client_tools is not None and client_tools.handles(name):
             return await client_tools.call(name, tool_input)
         return await run_tool(name, tool_input)

@@ -74,7 +74,12 @@ class Settings(BaseSettings):
     # replay into the prompt as a "where you left off" recap — cross-session
     # continuity the live history can't provide yet. Skipped once the session has
     # its own history (which already covers recent context). 0 disables the recap.
-    recent_recap_messages: int = 6
+    recent_recap_messages: int = 8
+    # How many recent durable messages the ``recall_recent`` tool returns when the
+    # user refers back to an earlier conversation (turn-based conversations). Off the
+    # per-turn path — paid only on turns where the model actually calls the tool —
+    # so it can be larger than the always-on recap above.
+    recall_messages: int = 12
 
     # --- Tools (Phase 4) ---
     # Max tool-use round trips the brain will make in one turn before it must
@@ -149,6 +154,11 @@ class Settings(BaseSettings):
     # and never calls back to the client. Independent of ``feature_tools`` (which
     # governs Amber's own server-side tools).
     feature_client_tools: bool = True
+    # Turn-based conversations: when true, the brain offers the ``expect_reply``
+    # signaling tool so Amber can deliberately hold a turn open for the user's
+    # answer (``turn_complete`` then carries ``awaiting_response``). When false the
+    # tool is never advertised and the field is never sent — identical to before.
+    feature_turn_based: bool = True
 
     # --- Sessions (Phase 5) ---
     # How long an idle session's in-memory history is retained for reconnect/

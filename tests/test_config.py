@@ -39,6 +39,14 @@ def test_tool_defaults():
     assert s.max_tool_iterations == 5
 
 
+def test_turn_based_defaults():
+    s = _fresh()
+    assert s.feature_turn_based is True
+    assert s.recall_messages == 12
+    # Cold-start recap was bumped for richer cross-session continuity.
+    assert s.recent_recap_messages == 8
+
+
 def test_auth_enabled_follows_secret():
     assert _fresh(auth_secret="").auth_enabled is False
     assert _fresh(auth_secret="hunter2").auth_enabled is True

@@ -3,8 +3,10 @@
 Two kinds, by the load-bearing distinction in the design:
 
 * **Inline tools** — fast and local to Amber: ``web_search``, the task tools
-  (``add_task`` / ``list_tasks`` / ``complete_task``), ``set_reminder``, and
-  ``update_server`` (run the deploy update script; only offered when configured).
+  (``add_task`` / ``list_tasks`` / ``complete_task``), ``set_reminder``,
+  ``recall_recent`` (read recent durable conversations on demand; only offered when
+  memory is on), and ``update_server`` (run the deploy update script; only offered
+  when configured).
 * **OpenClaw bridge** — ``delegate_to_openclaw`` for anything heavier (calendar,
   email, files, browsing), sent over HTTP to a separate service and awaited.
 
@@ -23,7 +25,7 @@ from __future__ import annotations
 from typing import Any
 
 # Importing the submodules is what populates the registry. Order is irrelevant.
-from app.tools import openclaw, reminders, search, tasks, update  # noqa: F401
+from app.tools import openclaw, recall, reminders, search, tasks, update  # noqa: F401
 from app.tools.registry import Tool, ToolRegistry, registry
 
 

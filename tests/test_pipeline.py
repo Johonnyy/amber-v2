@@ -87,6 +87,51 @@ async def test_run_turn_uses_llm_and_streams_audio(fake_io, monkeypatch):
     assert "How can I help?" in conv.messages[1]["content"]
 
 
+async def test_turn_complete_carries_awaiting_when_signaled(fake_io, monkeypatch):
+    """When the brain flips the turn signal, turn_complete carries awaiting_response."""
+
+    async def think(messages, system=None, signals=None, **kw):
+        signals.awaiting_response = True
+        yield "Which movie do you mean?"
+
+    monkeypatch.setattr(pipeline, "think", think)
+
+    conv = Conversation()
+    sink = FakeSink()
+    await pipeline.run_turn(b"a", sink.send_json, sink.send_bytes, conv)
+
+    complete = next(m for m in sink.json if m["type"] == protocol.TURN_COMPLETE)
+    assert complete.get("awaiting_response") is True
+
+
+async def test_turn_complete_omits_awaiting_by_default(fake_io, monkeypatch):
+    """An ordinary reply leaves the field off entirely (bare frame shape preserved)."""
+    monkeypatch.setattr(pipeline, "think", fake_brain("Sure thing."))
+
+    conv = Conversation()
+    sink = FakeSink()
+    await pipeline.run_turn(b"a", sink.send_json, sink.send_bytes, conv)
+
+    complete = next(m for m in sink.json if m["type"] == protocol.TURN_COMPLETE)
+    assert "awaiting_response" not in complete
+
+
+async def test_canned_path_never_awaits(fake_io, monkeypatch):
+    """The empty-transcript reprompt path never sets awaiting_response."""
+
+    async def fake_transcribe(audio, **kw):
+        return ""
+
+    monkeypatch.setattr(pipeline, "transcribe", fake_transcribe)
+
+    conv = Conversation()
+    sink = FakeSink()
+    await pipeline.run_turn(b"silence", sink.send_json, sink.send_bytes, conv)
+
+    complete = next(m for m in sink.json if m["type"] == protocol.TURN_COMPLETE)
+    assert "awaiting_response" not in complete
+
+
 async def test_history_persists_across_turns(fake_io, monkeypatch):
     seen_lengths: list[int] = []
 

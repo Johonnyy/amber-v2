@@ -85,8 +85,8 @@ def _no_server_tools(monkeypatch):
     monkeypatch.setattr(brain, "get_server_tool_schemas", lambda: [])
 
 
-async def _collect(messages, system=None):
-    return [t async for t in brain.think(messages, system=system)]
+async def _collect(messages, system=None, signals=None):
+    return [t async for t in brain.think(messages, system=system, signals=signals)]
 
 
 async def test_no_tools_path_streams_directly(monkeypatch):
@@ -231,6 +231,92 @@ async def test_caller_history_not_mutated(monkeypatch):
     await _collect(history)
     # The brain works on a copy — the caller's history is untouched.
     assert history == [{"role": "user", "content": "hi"}]
+
+
+# --- turn-based conversations: the expect_reply signaling tool ---
+
+
+async def test_expect_reply_sets_signal_and_still_speaks(monkeypatch):
+    """Calling expect_reply flips the turn signal, returns an ack to the loop, and
+    the spoken question still streams through — never routed to the registry."""
+    from app.turn_signals import TurnSignals
+
+    reply_call = _Block("tool_use", id="e1", name=brain.EXPECT_REPLY_TOOL, input={})
+    streams = [
+        _FakeStream(
+            ["Which one do you mean? "],
+            _FinalMessage(
+                [_Block("text", text="Which one do you mean? "), reply_call],
+                "tool_use",
+            ),
+        ),
+        # After the ack is fed back the model finishes (no more text).
+        _FakeStream([], _FinalMessage([], "end_turn")),
+    ]
+    client = _FakeClient(streams)
+    monkeypatch.setattr(brain, "get_client", lambda: client)
+    monkeypatch.setattr(brain, "get_tool_schemas", lambda: [])
+
+    async def boom(name, tool_input):
+        raise AssertionError("expect_reply must not be dispatched to the registry")
+
+    monkeypatch.setattr(brain, "run_tool", boom)
+
+    signals = TurnSignals()
+    out = await _collect([{"role": "user", "content": "play it"}], signals=signals)
+
+    assert "".join(out) == "Which one do you mean? "
+    assert signals.awaiting_response is True
+    # The tool was advertised on the first request...
+    assert any(
+        t.get("name") == brain.EXPECT_REPLY_TOOL
+        for t in client.messages.calls[0]["tools"]
+    )
+    # ...and the ack came back as the tool_result for the next iteration.
+    tool_result = client.messages.calls[1]["messages"][-1]
+    assert tool_result["content"][0]["tool_use_id"] == "e1"
+    assert "wait" in tool_result["content"][0]["content"].lower()
+
+
+async def test_expect_reply_not_offered_when_feature_off(monkeypatch):
+    from app.turn_signals import TurnSignals
+
+    monkeypatch.setenv("AMBER_FEATURE_TURN_BASED", "false")
+    brain.get_settings.cache_clear()
+    final = _FinalMessage([_Block("text", text="Sure.")], "end_turn")
+    client = _FakeClient([_FakeStream(["Sure."], final)])
+    monkeypatch.setattr(brain, "get_client", lambda: client)
+    monkeypatch.setattr(brain, "get_tool_schemas", lambda: [])
+
+    try:
+        signals = TurnSignals()
+        out = await _collect([{"role": "user", "content": "hi"}], signals=signals)
+        assert "".join(out) == "Sure."
+        assert signals.awaiting_response is False
+        # No tools at all -> the no-tools fast path (no `tools` kwarg on the call).
+        assert "tools" not in client.messages.calls[0]
+    finally:
+        brain.get_settings.cache_clear()
+
+
+async def test_expect_reply_offered_but_not_called_leaves_flag_false(monkeypatch):
+    """Feature on + signals passed -> tool is offered, but an ordinary turn that
+    never calls it leaves awaiting_response False (most turns just end)."""
+    from app.turn_signals import TurnSignals
+
+    final = _FinalMessage([_Block("text", text="It's sunny.")], "end_turn")
+    client = _FakeClient([_FakeStream(["It's sunny."], final)])
+    monkeypatch.setattr(brain, "get_client", lambda: client)
+    monkeypatch.setattr(brain, "get_tool_schemas", lambda: [])
+
+    signals = TurnSignals()
+    out = await _collect([{"role": "user", "content": "weather?"}], signals=signals)
+    assert "".join(out) == "It's sunny."
+    assert signals.awaiting_response is False
+    assert any(
+        t.get("name") == brain.EXPECT_REPLY_TOOL
+        for t in client.messages.calls[0]["tools"]
+    )
 
 
 async def test_iteration_cap_forces_final_answer(monkeypatch):

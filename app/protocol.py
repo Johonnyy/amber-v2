@@ -38,6 +38,12 @@ call:
     ``id`` (with optional ``is_error``), which Amber feeds back to the model.
 A client that never sends ``register_tools`` is unaffected — no ``tool_call`` is
 ever sent to it.
+
+Turn-based conversations extend ``turn_complete`` *additively* with an optional
+``awaiting_response`` field: ``True`` when Amber asked something it expects the user
+to answer, so the client should keep the mic open and send the next utterance as a
+continuation. The key is present only when ``True``; old clients ignore it and fall
+back to one-shot turns. The field is per-turn, never sticky.
 """
 
 from __future__ import annotations
@@ -104,8 +110,19 @@ def audio_chunk(index: int, text: str, audio_format: str) -> dict[str, Any]:
     }
 
 
-def turn_complete(sentences: int) -> dict[str, Any]:
-    return {"type": TURN_COMPLETE, "sentences": sentences}
+def turn_complete(sentences: int, awaiting_response: bool = False) -> dict[str, Any]:
+    """The full response has been sent.
+
+    ``awaiting_response`` (turn-based conversations) is ``True`` when Amber asked
+    something it expects the user to answer, so the client should keep the mic open
+    and treat the next utterance as a continuation. The key is attached only when
+    ``True`` — the bare ``{"type", "sentences"}`` shape is preserved otherwise, so
+    old clients (which ignore the unknown field anyway) degrade to one-shot turns.
+    """
+    frame: dict[str, Any] = {"type": TURN_COMPLETE, "sentences": sentences}
+    if awaiting_response:
+        frame["awaiting_response"] = True
+    return frame
 
 
 def memory(items: list[str]) -> dict[str, Any]:

@@ -87,6 +87,40 @@ def test_full_turn_over_websocket(faked_io):
         assert complete["sentences"] >= 2
 
 
+def test_awaiting_response_reaches_the_wire(fresh_caches, monkeypatch):
+    """A turn whose brain signals expect_reply puts awaiting_response on the
+    turn_complete frame a real client receives."""
+
+    async def fake_transcribe(audio, **kw):
+        return "play it"
+
+    async def fake_synthesize(text):
+        return f"AUDIO[{text}]".encode()
+
+    async def signaling_think(messages, system=None, signals=None, **kwargs):
+        signals.awaiting_response = True
+        yield "Which one do you mean?"
+
+    async def no_context(query=None, **kw):
+        return None, []
+
+    async def no_remember(user_text, reply, **kw):
+        return []
+
+    monkeypatch.setattr(pipeline, "transcribe", fake_transcribe)
+    monkeypatch.setattr(pipeline, "synthesize", fake_synthesize)
+    monkeypatch.setattr(pipeline, "think", signaling_think)
+    monkeypatch.setattr(pipeline, "build_memory_view", no_context)
+    monkeypatch.setattr(pipeline, "remember", no_remember)
+
+    client = TestClient(app)
+    with client.websocket_connect("/ws") as ws:
+        _read_ready(ws)
+        ws.send_bytes(b"pretend-this-is-audio")
+        complete = _drain_turn(ws)
+        assert complete.get("awaiting_response") is True
+
+
 def test_health_endpoint():
     client = TestClient(app)
     resp = client.get("/health")
