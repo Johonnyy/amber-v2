@@ -23,8 +23,7 @@ import json
 import logging
 import re
 from collections.abc import Iterable
-
-from anthropic import AsyncAnthropic
+from typing import Any
 
 from app.config import Settings, get_settings
 from app.memory.store import MemoryStore, get_store
@@ -98,34 +97,39 @@ async def extract_facts(
     known: Iterable[str] = (),
     *,
     settings: Settings | None = None,
-    client: AsyncAnthropic | None = None,
+    runner: Any | None = None,
 ) -> list[str]:
     """Ask the model for durable facts in this exchange. Never raises for empty input."""
     if not user_text.strip() or not assistant_text.strip():
         return []
     settings = settings or get_settings()
-    if client is None:
+    if runner is None:
         # Imported lazily: the brain (transitively) imports the tools package,
-        # which imports memory — a module-level `from app.brain import get_client`
-        # would close that loop into a circular import. The client is only needed
-        # at call time, so fetch it here.
-        from app.brain import get_client
+        # which imports memory — a module-level import would close that loop into a
+        # circular one. Only needed at call time, so fetch it here.
+        from agent_runtime import AgentRunner
 
-        client = get_client()
+        from app.brain import runtime_settings
 
-    resp = await client.messages.create(
-        model=settings.memory_model,
-        max_tokens=settings.memory_extract_max_tokens,
-        system=_EXTRACT_SYSTEM,
-        messages=[
-            {
-                "role": "user",
-                "content": _build_payload(user_text, assistant_text, known),
-            }
-        ],
-    )
+        runner = AgentRunner(
+            model=settings.memory_tier,
+            # No tools: this is a single extraction call, and offering tools to it
+            # would let a fact-distillation step start doing things.
+            broker=None,
+            max_tokens=settings.memory_extract_max_tokens,
+            settings=runtime_settings(settings),
+        )
+
+    # `stream` and join, rather than `run`, because `run` drives the sentence
+    # splitter — which is right for speech and wrong for a JSON array.
     raw = "".join(
-        block.text for block in resp.content if getattr(block, "type", None) == "text"
+        [
+            chunk
+            async for chunk in runner.stream(
+                _build_payload(user_text, assistant_text, known),
+                system=_EXTRACT_SYSTEM,
+            )
+        ]
     )
     return _parse_facts(raw, settings.memory_max_new_facts)
 

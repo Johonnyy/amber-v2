@@ -1,168 +1,288 @@
-"""Tests for the brain's tool-use loop (Anthropic client + tools faked, no network)."""
+"""The brain's wiring onto `agent_runtime`.
+
+The agentic loop itself — stream, spot a tool call, execute, feed back, repeat — is
+no longer Amber's code and is tested in `agent-runtime`. What matters here is that
+Amber hands that loop the right things: her tier, her tool registry, her settings,
+her conversation id, and that text deltas come back out untouched so the sentence
+splitter downstream is unaffected.
+
+Two layers of fake, on purpose. Most tests swap `brain.AgentRunner` for a recorder,
+which makes the wiring assertions direct. One test drives the *real* runner with a
+fake OpenAI-compatible client, so a signature change in `agent-runtime` fails here
+rather than in production.
+"""
 
 import pytest
 
 import app.brain as brain
+from app.config import Settings
 
 
-# --- fakes for the Anthropic streaming API ---
+def _settings(**over):
+    base = dict(
+        feature_tools=True,
+        llm_tier="balanced",
+        llm_max_tokens=256,
+        max_tool_iterations=4,
+        memory_db_path=":memory:",
+        openrouter_api_key="sk-test",
+        mcp_peers="",
+    )
+    base.update(over)
+    return Settings(_env_file=None, **base)
 
-class _Block:
-    def __init__(self, type, **kw):
-        self.type = type
-        for k, v in kw.items():
-            setattr(self, k, v)
 
+class _RecordingRunner:
+    """Stands in for AgentRunner, capturing how the brain constructed and called it."""
 
-class _FinalMessage:
-    def __init__(self, content, stop_reason):
-        self.content = content
-        self.stop_reason = stop_reason
+    instances: list["_RecordingRunner"] = []
 
+    def __init__(self, model=None, *, broker=None, settings=None, **kw):
+        self.model = model
+        self.broker = broker
+        self.settings = settings
+        self.kwargs = kw
+        self.stream_calls = []
+        self.chunks = ["Hello ", "there."]
+        _RecordingRunner.instances.append(self)
 
-class _FakeStream:
-    """One `messages.stream(...)` context: streams chunks, then a final message."""
+    def stream(self, messages, *, system=None, conversation_id=None, depth=0):
+        self.stream_calls.append(
+            {
+                "messages": messages,
+                "system": system,
+                "conversation_id": conversation_id,
+                "depth": depth,
+            }
+        )
 
-    def __init__(self, chunks, final):
-        self._chunks = chunks
-        self._final = final
-
-    async def __aenter__(self):
-        return self
-
-    async def __aexit__(self, *exc):
-        return False
-
-    @property
-    def text_stream(self):
         async def gen():
-            for c in self._chunks:
-                yield c
+            for chunk in self.chunks:
+                yield chunk
 
         return gen()
 
-    async def get_final_message(self):
-        return self._final
+
+@pytest.fixture
+def recorder(monkeypatch):
+    _RecordingRunner.instances = []
+    monkeypatch.setattr(brain, "AgentRunner", _RecordingRunner)
+    return _RecordingRunner
 
 
-class _FakeMessages:
-    def __init__(self, streams):
-        self._streams = list(streams)
+async def _collect(messages, **kw):
+    return [t async for t in brain.think(messages, **kw)]
+
+
+# --- the streaming contract, which everything downstream depends on ---
+
+
+async def test_think_still_yields_plain_text_deltas(recorder, monkeypatch):
+    monkeypatch.setattr(brain, "get_settings", _settings)
+    out = await _collect([{"role": "user", "content": "hi"}])
+    assert out == ["Hello ", "there."]
+    assert "".join(out) == "Hello there."
+
+
+async def test_the_history_is_passed_through_untouched(recorder, monkeypatch):
+    """The runner copies internally; the brain must not pre-mangle the caller's
+    history, which is also what the pipeline records to the conversation."""
+    monkeypatch.setattr(brain, "get_settings", _settings)
+    history = [
+        {"role": "user", "content": "hi"},
+        {"role": "assistant", "content": "hello"},
+        {"role": "user", "content": "what's my name?"},
+    ]
+    original = [dict(m) for m in history]
+    await _collect(history)
+
+    assert history == original
+    assert recorder.instances[0].stream_calls[0]["messages"] == original
+
+
+async def test_the_system_prompt_and_conversation_id_are_forwarded(
+    recorder, monkeypatch
+):
+    monkeypatch.setattr(brain, "get_settings", _settings)
+    await _collect(
+        [{"role": "user", "content": "hi"}],
+        system="PERSONA + MEMORY",
+        conversation_id="sess-42",
+    )
+    call = recorder.instances[0].stream_calls[0]
+    assert call["system"] == "PERSONA + MEMORY"
+    assert call["conversation_id"] == "sess-42"
+
+
+async def test_the_persona_prompt_is_the_default_system(recorder, monkeypatch):
+    monkeypatch.setattr(brain, "get_settings", _settings)
+    await _collect([{"role": "user", "content": "hi"}])
+    assert recorder.instances[0].stream_calls[0]["system"] == brain.SYSTEM_PROMPT
+
+
+# --- tier and settings injection ---
+
+
+async def test_the_named_tier_is_used_not_a_model_id(recorder, monkeypatch):
+    """Model choice is a tier resolved by agent_runtime's router, so upgrading every
+    app is one edit there rather than one per app."""
+    monkeypatch.setattr(brain, "get_settings", lambda: _settings(llm_tier="strong"))
+    await _collect([{"role": "user", "content": "hi"}])
+    assert recorder.instances[0].model == "strong"
+
+
+def test_runtime_settings_come_from_ambers_config_not_the_environment(monkeypatch):
+    """agent_runtime would read AGENT_RUNTIME_* if asked. Amber injects instead, so
+    there is one prefix and no chance of two sources disagreeing about the DB."""
+    monkeypatch.setenv("AGENT_RUNTIME_APP_NAME", "WRONG")
+    monkeypatch.setenv("AGENT_RUNTIME_DB_PATH", "wrong.db")
+
+    rs = brain.runtime_settings(_settings(memory_db_path="amber.db", llm_tier="cheap"))
+    assert rs.app_name == "amber"
+    assert rs.db_path == "amber.db"  # same file as memory + the MCP tool log
+    assert rs.default_tier == "cheap"
+    assert rs.max_tokens == 256
+    assert rs.max_steps == 4
+
+
+def test_the_cost_log_shares_ambers_database():
+    rs = brain.runtime_settings(_settings(memory_db_path="/tmp/amber.db"))
+    assert rs.db_path == "/tmp/amber.db"
+
+
+# --- tool wiring ---
+
+
+def test_the_broker_adapts_ambers_existing_registry():
+    broker = brain.build_broker(_settings())
+    assert isinstance(broker, brain.AnthropicRegistryBroker)
+
+
+async def test_ambers_real_tools_reach_the_runner():
+    broker = brain.build_broker(_settings())
+    names = {s["function"]["name"] for s in await broker.list_tools()}
+    assert {"add_task", "list_tasks", "complete_task", "web_search"} <= names
+
+
+async def test_a_tool_call_runs_the_same_function_the_voice_path_uses(monkeypatch):
+    """Not a parallel implementation: the broker dispatches through app.tools."""
+    called = {}
+
+    async def fake_run_tool(name, args):
+        called["args"] = (name, args)
+        return "did it"
+
+    monkeypatch.setattr(brain, "run_tool", fake_run_tool)
+    broker = brain.build_broker(_settings())
+    result = await broker.call_tool("add_task", {"description": "buy milk"})
+
+    assert result == "did it"
+    assert called["args"] == ("add_task", {"description": "buy milk"})
+
+
+def test_tools_off_means_no_broker_at_all(recorder):
+    assert brain.build_broker(_settings(feature_tools=False)) is None
+
+
+async def test_tools_off_streams_a_direct_reply(recorder, monkeypatch):
+    monkeypatch.setattr(brain, "get_settings", lambda: _settings(feature_tools=False))
+    out = await _collect([{"role": "user", "content": "hi"}])
+    assert "".join(out) == "Hello there."
+    assert recorder.instances[0].broker is None
+
+
+def test_peers_are_merged_alongside_the_inline_tools():
+    """Heavy work now goes to another agent's MCP server — the inline-vs-delegated
+    distinction the design turns on, with the OpenClaw bridge replaced."""
+    broker = brain.build_broker(
+        _settings(mcp_peers="finance=https://finance.test", mcp_peer_token="tok")
+    )
+    assert isinstance(broker, brain.CompositeBroker)
+    # Amber's own tools come first, so a colliding peer name never shadows hers.
+    assert isinstance(broker.brokers[0], brain.AnthropicRegistryBroker)
+    assert isinstance(broker.brokers[1], brain.MCPClient)
+    assert broker.brokers[1].servers == ["finance"]
+
+
+def test_no_peers_means_no_mcp_client():
+    assert isinstance(brain.build_broker(_settings()), brain.AnthropicRegistryBroker)
+
+
+# --- against the real runner, to catch signature drift ---
+
+
+class _Delta:
+    def __init__(self, content=None):
+        self.content = content
+        self.tool_calls = None
+
+
+class _Choice:
+    def __init__(self, delta):
+        self.delta = delta
+        self.finish_reason = None
+
+
+class _Chunk:
+    def __init__(self, content=None):
+        self.choices = [_Choice(_Delta(content))]
+        self.usage = None
+
+
+class _FakeStream:
+    def __init__(self, parts):
+        self._parts = parts
+
+    def __aiter__(self):
+        async def gen():
+            for part in self._parts:
+                yield _Chunk(part)
+
+        return gen()
+
+    async def close(self):
+        return None
+
+
+class _FakeCompletions:
+    def __init__(self):
         self.calls = []
 
-    def stream(self, **kwargs):
+    async def create(self, **kwargs):
         self.calls.append(kwargs)
-        return self._streams.pop(0)
+        return _FakeStream(["Real ", "runner."])
 
 
-class _FakeClient:
-    def __init__(self, streams):
-        self.messages = _FakeMessages(streams)
+class _FakeOpenAI:
+    def __init__(self):
+        self.chat = type("_Chat", (), {"completions": _FakeCompletions()})()
 
 
-async def _collect(messages, system=None):
-    return [t async for t in brain.think(messages, system=system)]
+async def test_the_real_runner_accepts_what_the_brain_passes(monkeypatch):
+    """No recorder: the genuine AgentRunner, driven by a fake OpenAI-compatible
+    client. If agent-runtime changes a signature the brain relies on, this fails
+    here instead of at the first real voice turn."""
+    from agent_runtime import AgentRunner
 
+    fake = _FakeOpenAI()
+    real_settings = _settings()
+    monkeypatch.setattr(brain, "get_settings", lambda: real_settings)
 
-async def test_no_tools_path_streams_directly(monkeypatch):
-    """With no tools available the brain takes the plain Phase-2/3 stream path."""
-    final = _FinalMessage([_Block("text", text="Hello.")], "end_turn")
-    client = _FakeClient([_FakeStream(["Hello."], final)])
-    monkeypatch.setattr(brain, "get_client", lambda: client)
-    monkeypatch.setattr(brain, "get_tool_schemas", lambda: [])
+    def _runner_with_fake_client(model=None, *, broker=None, settings=None, **kw):
+        return AgentRunner(
+            model, broker=broker, settings=settings, client=fake, **kw
+        )
 
-    out = await _collect([{"role": "user", "content": "hi"}])
-    assert "".join(out) == "Hello."
-    # One call, and no tools were offered.
-    assert len(client.messages.calls) == 1
-    assert "tools" not in client.messages.calls[0]
+    monkeypatch.setattr(brain, "AgentRunner", _runner_with_fake_client)
 
+    out = await _collect(
+        [{"role": "user", "content": "hi"}], system="S", conversation_id="c1"
+    )
+    assert "".join(out) == "Real runner."
 
-async def test_tool_loop_executes_then_answers(monkeypatch):
-    tool_block = _Block("tool_use", id="t1", name="web_search", input={"query": "x"})
-    streams = [
-        _FakeStream(
-            ["Let me check. "],
-            _FinalMessage(
-                [_Block("text", text="Let me check. "), tool_block], "tool_use"
-            ),
-        ),
-        _FakeStream(
-            ["The answer is 42."],
-            _FinalMessage([_Block("text", text="The answer is 42.")], "end_turn"),
-        ),
-    ]
-    client = _FakeClient(streams)
-    monkeypatch.setattr(brain, "get_client", lambda: client)
-    monkeypatch.setattr(brain, "get_tool_schemas", lambda: [{"name": "web_search"}])
-
-    calls = []
-
-    async def fake_run_tool(name, tool_input):
-        calls.append((name, tool_input))
-        return "result: 42"
-
-    monkeypatch.setattr(brain, "run_tool", fake_run_tool)
-
-    out = await _collect([{"role": "user", "content": "hi"}], system="S")
-    assert "".join(out) == "Let me check. The answer is 42."
-    assert calls == [("web_search", {"query": "x"})]
-
-    # The second LLM call carried the assistant tool_use turn + the tool_result.
-    second = client.messages.calls[1]["messages"]
-    assert second[-2]["role"] == "assistant"
-    tool_result = second[-1]
-    assert tool_result["role"] == "user"
-    assert tool_result["content"][0]["type"] == "tool_result"
-    assert tool_result["content"][0]["tool_use_id"] == "t1"
-    assert tool_result["content"][0]["content"] == "result: 42"
-
-
-async def test_caller_history_not_mutated(monkeypatch):
-    tool_block = _Block("tool_use", id="t1", name="web_search", input={})
-    streams = [
-        _FakeStream([], _FinalMessage([tool_block], "tool_use")),
-        _FakeStream(["done"], _FinalMessage([_Block("text", text="done")], "end_turn")),
-    ]
-    client = _FakeClient(streams)
-    monkeypatch.setattr(brain, "get_client", lambda: client)
-    monkeypatch.setattr(brain, "get_tool_schemas", lambda: [{"name": "web_search"}])
-
-    async def fake_run_tool(name, tool_input):
-        return "ok"
-
-    monkeypatch.setattr(brain, "run_tool", fake_run_tool)
-
-    history = [{"role": "user", "content": "hi"}]
-    await _collect(history)
-    # The brain works on a copy — the caller's history is untouched.
-    assert history == [{"role": "user", "content": "hi"}]
-
-
-async def test_iteration_cap_forces_final_answer(monkeypatch):
-    monkeypatch.setenv("AMBER_MAX_TOOL_ITERATIONS", "1")
-    brain.get_settings.cache_clear()
-
-    tool_block = _Block("tool_use", id="t1", name="web_search", input={})
-    streams = [
-        # The single allowed tool iteration keeps asking for a tool...
-        _FakeStream([], _FinalMessage([tool_block], "tool_use")),
-        # ...so the safety valve fires a final, tools-off stream for the answer.
-        _FakeStream(["Final answer."], _FinalMessage([], "end_turn")),
-    ]
-    client = _FakeClient(streams)
-    monkeypatch.setattr(brain, "get_client", lambda: client)
-    monkeypatch.setattr(brain, "get_tool_schemas", lambda: [{"name": "web_search"}])
-
-    async def fake_run_tool(name, tool_input):
-        return "ok"
-
-    monkeypatch.setattr(brain, "run_tool", fake_run_tool)
-
-    try:
-        out = await _collect([{"role": "user", "content": "hi"}])
-        assert "".join(out) == "Final answer."
-        # Final call is the tools-off safety valve.
-        assert "tools" not in client.messages.calls[-1]
-    finally:
-        brain.get_settings.cache_clear()
+    sent = fake.chat.completions.calls[0]
+    assert sent["messages"][0] == {"role": "system", "content": "S"}
+    assert sent["max_tokens"] == 256
+    assert sent["stream"] is True
+    # Amber's tools were offered, in OpenAI function shape.
+    assert {t["function"]["name"] for t in sent["tools"]} >= {"add_task", "web_search"}

@@ -50,7 +50,7 @@ def fake_io(monkeypatch):
 def fake_brain(*chunks):
     """Build a fake `think` that streams the given text chunks."""
 
-    async def think(messages, system=None):
+    async def think(messages, system=None, **kw):
         for chunk in chunks:
             yield chunk
 
@@ -90,7 +90,7 @@ async def test_run_turn_uses_llm_and_streams_audio(fake_io, monkeypatch):
 async def test_history_persists_across_turns(fake_io, monkeypatch):
     seen_lengths: list[int] = []
 
-    async def think(messages, system=None):
+    async def think(messages, system=None, **kw):
         # Record how much history the brain was handed each turn.
         seen_lengths.append(len(messages))
         yield "Okay."
@@ -134,7 +134,7 @@ async def test_empty_transcript_reprompts_without_calling_llm(fake_io, monkeypat
 async def test_interrupt_saves_partial_reply(fake_io, monkeypatch):
     streamed = asyncio.Event()
 
-    async def think(messages, system=None):
+    async def think(messages, system=None, **kw):
         yield "First sentence. "
         yield "Second sentence "
         streamed.set()

@@ -6,13 +6,22 @@ requires-python = ">=3.11"
 dependencies = [
     "fastapi>=0.115",
     "uvicorn[standard]>=0.30",
+    # STT (Whisper) + TTS. The *brain* no longer uses this directly — it goes
+    # through agent-runtime to OpenRouter.
     "openai>=1.40",
-    "anthropic>=0.49",
     "pydantic>=2.7",
     "pydantic-settings>=2.3",
     "python-dotenv>=1.0",
-    # HTTP client for the inline web_search tool and the OpenClaw bridge (Phase 4).
+    # HTTP client for the inline web_search tool.
     "httpx>=0.27",
+    # The shared agentic loop. Replaces the hand-rolled Anthropic tool loop that
+    # used to live in app/brain.py, which is why `anthropic` is no longer a
+    # dependency here. The [mcp] extra brings the MCP SDK so Amber can call other
+    # apps' servers as a client.
+    "agent-runtime[mcp] @ git+https://github.com/Johonnyy/agent-runtime@8bd6ae6",
+    # The convention layer for Amber's own MCP server, so other agents and
+    # Lucidity can query her memory, tasks, and reminders.
+    "agent-mcp-py @ git+https://github.com/Johonnyy/agent-mcp-py@793a449",
 ]
 
 [project.optional-dependencies]

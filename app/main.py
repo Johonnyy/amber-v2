@@ -23,8 +23,11 @@ Phase 5 additions:
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, status
 
@@ -40,7 +43,50 @@ logging.basicConfig(
 )
 logger = logging.getLogger("amber")
 
-app = FastAPI(title="Amber", version="0.1.0")
+
+@asynccontextmanager
+async def lifespan(app: FastAPI) -> AsyncIterator[None]:
+    """Run Amber's own MCP server alongside the voice socket.
+
+    A mounted sub-app's lifespan never runs, so the host has to enter the MCP
+    session manager itself or the very first MCP request fails. `agent_mcp` wraps
+    that (plus sync-store registration and its heartbeat) in one context manager.
+
+    Nothing here is required for the voice loop: when the MCP server is disabled or
+    unconfigured this is an empty context, and `/ws` behaves exactly as before.
+    """
+    if not get_settings().mcp_server_enabled:
+        logger.info("MCP server disabled (no AMBER_MCP_KEYS); serving voice only")
+        yield
+        return
+
+    from app.mcp_server import get_mcp_server
+
+    async with get_mcp_server().lifespan():
+        logger.info("MCP server mounted at /mcp")
+        yield
+
+
+app = FastAPI(title="Amber", version="0.1.0", lifespan=lifespan)
+
+
+def _mount_mcp(app: FastAPI, settings: Settings) -> None:
+    """Attach Amber's MCP server and its usage endpoint, if enabled.
+
+    Routes rather than ``app.mount``: ``Mount("/mcp")`` alone does not match a bare
+    ``POST /mcp``, so the host router answers it with a 307 that the MCP client does
+    not follow. ``routes()`` claims both forms.
+    """
+    if not settings.mcp_server_enabled:
+        return
+    from app.mcp_server import get_mcp_server
+
+    mcp = get_mcp_server()
+    app.router.routes.extend(mcp.routes())
+    app.router.routes.extend(mcp.usage_routes())
+
+
+_mount_mcp(app, settings)
 
 
 @app.get("/health")
@@ -204,7 +250,9 @@ async def _guarded_turn(
 ) -> None:
     """Run one turn, converting failures into an error frame instead of a crash."""
     try:
-        await run_turn(audio, send_json, send_bytes, conversation)
+        await run_turn(
+            audio, send_json, send_bytes, conversation, conversation_id=session_id
+        )
     except asyncio.CancelledError:
         raise  # interrupt/barge-in — expected, let it unwind
     except Exception as exc:  # noqa: BLE001 — surface any turn failure to the client

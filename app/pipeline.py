@@ -57,13 +57,19 @@ async def run_turn(
     send_json: SendJson,
     send_bytes: SendBytes,
     conversation: Conversation | None = None,
+    *,
+    conversation_id: str | None = None,
 ) -> int:
     """Process one user turn and stream the spoken reply back.
 
     ``conversation`` carries the per-connection history; if omitted a throwaway one
-    is used (single-turn, no memory). Returns the number of sentences spoken.
-    Raises on transport/API failure so the caller can emit an error frame;
-    ``asyncio.CancelledError`` from an interrupt is allowed to propagate untouched.
+    is used (single-turn, no memory). ``conversation_id`` is the session id, passed
+    down so this turn's model spend and tool calls are attributable to it in the
+    usage tables and so any peer agent Amber calls joins the same exchange.
+
+    Returns the number of sentences spoken. Raises on transport/API failure so the
+    caller can emit an error frame; ``asyncio.CancelledError`` from an interrupt is
+    allowed to propagate untouched.
     """
     settings = get_settings()
     conversation = conversation if conversation is not None else Conversation()
@@ -86,7 +92,11 @@ async def run_turn(
             spoken = await _speak_stream(_canned(_DIDNT_CATCH), send_json, send_bytes)
         else:
             spoken, reply = await _think_and_speak(
-                transcript_text, conversation, send_json, send_bytes
+                transcript_text,
+                conversation,
+                send_json,
+                send_bytes,
+                conversation_id=conversation_id,
             )
     finally:
         await send_json(protocol.thinking(False))
@@ -113,6 +123,8 @@ async def _think_and_speak(
     conversation: Conversation,
     send_json: SendJson,
     send_bytes: SendBytes,
+    *,
+    conversation_id: str | None = None,
 ) -> tuple[int, str]:
     """Record the user turn, stream a reply, and record what was spoken.
 
@@ -135,7 +147,9 @@ async def _think_and_speak(
         if memory_items:
             await send_json(protocol.memory(memory_items))
         system = compose_system_prompt(memory_block)
-        tokens = think(conversation.messages, system=system)
+        tokens = think(
+            conversation.messages, system=system, conversation_id=conversation_id
+        )
     else:
         tokens = respond(transcript_text)
 

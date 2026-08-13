@@ -4,36 +4,91 @@ A cloud-hosted personal AI voice backend — a persistent, always-available voic
 agent with no UI of its own. Clients (an earpiece, a Pi, a browser tab) only record
 and play audio; Amber is the intelligence behind all of them.
 
-See [CLAUDE.md](CLAUDE.md) for the full design spec and phase plan.
+See [CLAUDE.md](CLAUDE.md) for the full design spec and the ecosystem context.
 
-**This repo currently implements Phase 1: skeleton & voice pipeline.** There's no
-LLM brain yet (Phase 2) — Amber transcribes what you say and speaks back a canned
-greeting, which proves the end-to-end pipe and exercises the sentence-streaming seam.
+**All five phases are built** — voice pipeline, LLM brain + conversation, persistent
+memory, tools, and polish/reliability — and the ecosystem refactor has landed: the
+agentic loop now comes from the shared `agent-runtime` library, and Amber exposes
+her own MCP server via `agent-mcp-py` so other agents can query her.
 
 ## The voice loop
 
 ```
-client records audio → WS → STT (Whisper) → think → sentence splitter
+client records audio → WS → STT (Whisper) → brain → sentence splitter
   → TTS (OpenAI) → WS → client plays, sentence by sentence
 ```
 
 Audio streams back **sentence by sentence**: the splitter sits between the
 response stream and TTS so the first sentence plays before the whole reply exists.
+This is the performance-critical seam, and nothing in the refactor moved it — the
+brain still hands downstream an `AsyncIterator[str]`, and tool round trips happen
+invisibly inside it.
+
+## Two directions
+
+Amber both **calls** and **is called**:
+
+```
+          voice client ──WS──►  /ws   ─► brain ─► agent-runtime ─► OpenRouter
+                                              └─► tools ─┬─► inline (app/tools)
+                                                         └─► peer MCP servers
+  spawner / Lucidity ──HTTP──►  /mcp  ─► Amber's MCP server (memory, tasks)
+                                /agent/usage
+```
+
+Heavy or delegated work used to go over an HTTP bridge to OpenClaw. That bridge is
+gone; the same distinction now runs through peer MCP servers configured in
+`AMBER_MCP_PEERS`.
 
 ## Layout
 
 | Path | Role |
 |------|------|
-| [app/config.py](app/config.py) | All models / keys / flags (pydantic-settings) |
+| [app/config.py](app/config.py) | All tiers / keys / flags (pydantic-settings, `AMBER_` prefix) |
 | [app/protocol.py](app/protocol.py) | WebSocket wire contract (stable, public) |
 | [app/sentence_splitter.py](app/sentence_splitter.py) | Streaming splitter — the perf-critical seam |
 | [app/stt.py](app/stt.py) | Whisper transcription |
 | [app/tts.py](app/tts.py) | OpenAI TTS (per-sentence) |
-| [app/responder.py](app/responder.py) | Phase-1 canned "brain" (replaced in Phase 2) |
+| [app/brain.py](app/brain.py) | The brain — wires `agent-runtime` to Amber's tools |
+| [app/persona.py](app/persona.py) | System prompt + memory block composition |
+| [app/responder.py](app/responder.py) | Canned fallback when `AMBER_FEATURE_LLM=false` |
+| [app/memory/](app/memory/) | SQLite store, fact writer, context builder |
+| [app/tools/](app/tools/) | Inline tools + the registry the brain and MCP server share |
+| [app/mcp_server.py](app/mcp_server.py) | Amber's own MCP server (`agent-mcp-py`) |
+| [app/session.py](app/session.py) | Per-connection history, session manager |
 | [app/pipeline.py](app/pipeline.py) | The voice loop |
-| [app/main.py](app/main.py) | FastAPI app + `/ws` endpoint + interrupt handling |
+| [app/main.py](app/main.py) | FastAPI app, `/ws`, `/mcp`, `/agent/usage` |
 | [deploy/](deploy/) | systemd unit + VPS setup |
 | [scripts/smoke_client.py](scripts/smoke_client.py) | Manual end-to-end client |
+
+## Shared libraries
+
+Two sibling repos, pinned by commit in [pyproject.toml](pyproject.toml):
+
+- **`agent-runtime`** — the agentic loop (call model → tool call → execute →
+  repeat), streaming, cost tracking, and the model-tier router. Amber's brain is a
+  thin wrapper over it, which is why `anthropic` is no longer a dependency.
+- **`agent-mcp-py`** — the convention layer for Amber's own MCP server: bearer
+  auth, the conversation-depth guard, per-call usage logging, sync-store
+  registration.
+
+**They are configured by injection, not environment.** Both would happily read
+`AGENT_RUNTIME_*` / `AGENT_MCP_*` variables; Amber builds their settings objects
+from `app/config.py` instead, so there is one prefix and no chance of two sources
+disagreeing about — most damagingly — which database to write.
+
+Model choice is a **named tier** (`AMBER_LLM_TIER=balanced`) resolved by
+`agent_runtime.model_router`, not a model id. Upgrading the model every app uses is
+one edit in the router. Today `balanced` is Claude Haiku, which is what Amber was
+pinned to before the indirection existed.
+
+## One database, three writers
+
+`amber.db` holds Amber's memory (`facts`, `conversations`, `tasks`, `reminders`),
+the MCP layer's tool log (`agent_mcp_usage`), and the runtime's model spend
+(`agent_runtime_usage`). WAL plus a busy timeout makes the three-way tenancy safe,
+and the shared `conversation_id` / `app_name` / `depth` / `created_at` columns mean
+spend can be joined to the calls that caused it.
 
 ## Local development
 
@@ -42,15 +97,15 @@ python -m venv .venv
 .venv/Scripts/activate          # Windows;  use .venv/bin/activate on Linux/macOS
 pip install -e ".[dev]"
 
-cp .env.example .env            # then set AMBER_OPENAI_API_KEY
+cp .env.example .env            # then set AMBER_OPENAI_API_KEY + AMBER_OPENROUTER_API_KEY
 
 # run the server
 uvicorn app.main:app --reload
 
-# run the tests (no network / API key needed — STT & TTS are faked)
+# run the tests (no network / API key needed — STT, TTS and the model are faked)
 pytest
 
-# prove the pipe end to end against the running server (needs a real API key)
+# prove the pipe end to end against the running server (needs real API keys)
 python scripts/smoke_client.py path/to/utterance.wav
 ```
 
@@ -64,9 +119,34 @@ Every client speaks this; see [app/protocol.py](app/protocol.py) for exact shape
 - **Send** `{"type":"interrupt"}` = stop Amber mid-reply. Sending new audio while
   Amber is speaking also barges in (cancels the current turn).
 - **Receive** JSON control frames (`ready`, `transcript`, `thinking`,
-  `audio_chunk`, `turn_complete`, `error`) interleaved with binary audio frames.
-  Each `audio_chunk` frame is immediately followed by the binary audio for that
-  sentence.
+  `audio_chunk`, `memory`, `turn_complete`, `error`) interleaved with binary audio
+  frames. Each `audio_chunk` frame is immediately followed by the binary audio for
+  that sentence.
+
+## Amber's MCP server
+
+Mounted at `/mcp` when `AMBER_MCP_KEYS` is set — **without keys it is simply not
+mounted**, because `agent-mcp-py` fails closed and a default install should not
+expose an open server.
+
+| Kind | URI / name | |
+|---|---|---|
+| resource | `amber://memory/facts{?limit}` | distilled facts, newest first |
+| resource | `amber://tasks/open` | open tasks, oldest first |
+| resource | `amber://reminders/pending` | undelivered reminders |
+| resource | `amber://memory/conversations{?limit}` | recent logged exchanges |
+| tool | `search_memory` | read-only |
+| tool | `list_tasks` | read-only |
+| tool | `add_task` / `complete_task` | mutating |
+
+`GET /agent/usage` returns the per-tool / per-caller summary the spawner reads.
+
+The tools dispatch through the **same** `app/tools` registry the brain uses, so a
+task added by a peer agent and one added by voice take the identical code path.
+
+Callers present `Authorization: Bearer <token>`; use the `name:token` form in
+`AMBER_MCP_KEYS` so usage rows record who called. Address `/mcp` or `/mcp/` — both
+work.
 
 ## Deploy
 

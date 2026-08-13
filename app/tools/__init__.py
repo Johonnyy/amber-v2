@@ -1,11 +1,14 @@
-"""Amber's tools (Phase 4) — inline tools + the OpenClaw bridge.
+"""Amber's inline tools.
 
-Two kinds, by the load-bearing distinction in the design:
+Fast and local to Amber: ``web_search``, the task tools (``add_task`` /
+``list_tasks`` / ``complete_task``), and ``set_reminder``. A tool here is an
+ordinary Python call — Amber never makes an HTTP request to herself to add a task.
 
-* **Inline tools** — fast and local to Amber: ``web_search``, the task tools
-  (``add_task`` / ``list_tasks`` / ``complete_task``), and ``set_reminder``.
-* **OpenClaw bridge** — ``delegate_to_openclaw`` for anything heavier (calendar,
-  email, files, browsing), sent over HTTP to a separate service and awaited.
+The inline-vs-delegated distinction the design turns on is still live, but the far
+end changed: heavier work (calendar, email, files, browsing) now goes to another
+agent's **MCP server**, configured as a peer in ``AMBER_MCP_PEERS`` and merged in
+by `app.brain.build_broker`. The old OpenClaw HTTP bridge that used to occupy that
+role is gone.
 
 Importing this package *registers* every tool on the shared ``registry`` — the
 submodule imports below run the ``@registry.register`` decorators. The brain pulls
@@ -18,7 +21,7 @@ from __future__ import annotations
 from typing import Any
 
 # Importing the submodules is what populates the registry. Order is irrelevant.
-from app.tools import openclaw, reminders, search, tasks  # noqa: F401
+from app.tools import reminders, search, tasks  # noqa: F401
 from app.tools.registry import Tool, ToolRegistry, registry
 
 

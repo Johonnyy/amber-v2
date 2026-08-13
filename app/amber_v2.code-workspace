@@ -1,0 +1,13 @@
+{
+	"folders": [
+		{
+			"path": "..",
+		},
+		{
+			"path": "../../amber_web_dev_client",
+		},
+		{
+			"path": "../../agent-mcp-py",
+		},
+	],
+}

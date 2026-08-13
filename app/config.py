@@ -1,11 +1,18 @@
 """Central configuration.
 
-Every model choice, API key, and feature flag flows through here so the brain
-(Phase 2), STT, and TTS are swappable without touching call sites. Nothing in the
-codebase should hardcode a model name or key — import `settings` instead.
+Every model choice, API key, and feature flag flows through here so the brain,
+STT, and TTS are swappable without touching call sites. Nothing in the codebase
+should hardcode a model name or key — import `settings` instead.
 
 Values are read from environment variables (prefix ``AMBER_``) and an optional
 `.env` file. See `.env.example` for the full list.
+
+**One prefix, three consumers.** Amber now embeds two shared libraries
+(`agent_runtime`, `agent_mcp`) that can each read their own ``AGENT_RUNTIME_*`` /
+``AGENT_MCP_*`` environment. Amber does not use that: both are configured by
+*injection* from the values below, so there is a single place to look and no
+possibility of two prefixes disagreeing about, say, which database to write. See
+`app.brain` and `app.mcp_server` for where the settings objects are built.
 """
 
 from __future__ import annotations
@@ -29,9 +36,13 @@ class Settings(BaseSettings):
         default="",
         description="OpenAI API key used for both STT (Whisper) and TTS.",
     )
-    anthropic_api_key: str = Field(
+    openrouter_api_key: str = Field(
         default="",
-        description="Anthropic API key used for the LLM brain (Claude).",
+        description=(
+            "OpenRouter API key for the LLM brain, used via agent-runtime. "
+            "Replaces the direct Anthropic key: the brain now reaches every "
+            "provider through one endpoint and a named tier."
+        ),
     )
 
     # --- Server ---
@@ -44,14 +55,19 @@ class Settings(BaseSettings):
     tts_model: str = "tts-1"
     tts_voice: str = "alloy"
     tts_format: str = "mp3"
-    # The brain (Claude Haiku — fast, low-latency, good for a voice loop).
-    llm_model: str = "claude-haiku-4-5-20251001"
+    # The brain, as a **named tier** rather than a model id. agent_runtime's
+    # model_router resolves "balanced" -> a concrete model, so upgrading every app
+    # in the ecosystem is one edit in the router rather than one per app. Today
+    # "balanced" is Claude Haiku, which is what Amber used before this indirection
+    # existed — fast and low-latency, which is what a voice loop needs. A literal
+    # model id containing "/" still passes through as an escape hatch.
+    llm_tier: str = "balanced"
     # Cap on a single spoken reply. Voice answers are short; keep this modest so
     # a runaway generation can't stream for minutes. Bump it for longer replies.
     llm_max_tokens: int = 1024
     # The memory writer's fact-extraction model (Phase 3). Off the latency path, so
-    # it could be a beefier model; defaults to the brain's for cost/simplicity.
-    memory_model: str = "claude-haiku-4-5-20251001"
+    # it could be a beefier tier; defaults to the brain's for cost/simplicity.
+    memory_tier: str = "balanced"
     # Token cap for one fact-extraction call. Output is a short JSON list; keep low.
     memory_extract_max_tokens: int = 512
 
@@ -79,15 +95,12 @@ class Settings(BaseSettings):
     # model pays for them in tokens, and voice answers are short).
     search_max_results: int = 3
     search_timeout_s: float = 10.0
-    # OpenClaw bridge — heavy/delegated work over HTTP to the separate OpenClaw
-    # service. The tool is only offered to the model when a URL is configured.
-    # ``openclaw_url`` is the host/gateway (e.g. "https://10.0.0.5:8080"),
-    # ``openclaw_token`` the gateway/bearer token sent as Authorization.
-    openclaw_url: str = ""
-    openclaw_token: str = ""
-    # OpenClaw work can be slow (browser, multi-step); allow a generous timeout —
-    # the bridge blocks the response until it returns.
-    openclaw_timeout_s: float = 60.0
+    # Peer MCP servers Amber may call as a client, as "name=https://host" pairs.
+    # Heavy or delegated work goes here now that the OpenClaw bridge is gone — the
+    # inline-vs-delegated distinction survives, only the far end changed. Empty
+    # means Amber has no peers and uses inline tools only.
+    mcp_peers: str = ""
+    mcp_peer_token: str = ""
 
     # --- Feature flags ---
     feature_stt: bool = True
@@ -100,6 +113,23 @@ class Settings(BaseSettings):
     # When false, the brain never offers tools to the model — it streams a direct
     # reply exactly as Phase 2/3. Lets the loop run without any tool plumbing.
     feature_tools: bool = True
+    # When false, Amber's own MCP server is not mounted. She stays a *caller* of
+    # other agents either way; this only controls whether she is queryable herself.
+    feature_mcp_server: bool = True
+
+    # --- Amber's own MCP server ---
+    # Comma-separated bearer tokens other agents present to query Amber, each
+    # optionally "name:token" so the usage log records who called. agent-mcp-py
+    # fails closed, so no keys means the server is simply not mounted rather than
+    # mounted wide open — see `mcp_server_enabled`.
+    mcp_keys: str = ""
+    # Amber's externally reachable base URL, no /mcp suffix. Needed only to
+    # register with the hosted sync store; she serves normally without it.
+    mcp_public_url: str = ""
+    # The hosted discovery store. Empty disables registration, and an unreachable
+    # one never blocks startup.
+    mcp_sync_store_url: str = ""
+    mcp_sync_store_token: str = ""
 
     # --- Sessions (Phase 5) ---
     # How long an idle session's in-memory history is retained for reconnect/
@@ -134,6 +164,16 @@ class Settings(BaseSettings):
     @property
     def auth_enabled(self) -> bool:
         return bool(self.auth_secret)
+
+    @property
+    def mcp_server_enabled(self) -> bool:
+        """True if Amber should mount her own MCP server.
+
+        Requires keys as well as the flag. agent-mcp-py fails closed and refuses to
+        build an unauthenticated app, so without this check a default install would
+        crash at startup rather than simply not exposing a server nobody asked for.
+        """
+        return self.feature_mcp_server and bool(self.mcp_keys.strip())
 
 
 @lru_cache

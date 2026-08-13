@@ -1,7 +1,7 @@
 """Tests for the memory writer — fact parsing, extraction, and persistence.
 
-The LLM is always faked: either a fake Anthropic client (for `extract_facts`) or a
-monkeypatched `extract_facts` (for `remember`). No network.
+The LLM is always faked: either a fake `agent_runtime` runner (for `extract_facts`)
+or a monkeypatched `extract_facts` (for `remember`). No network.
 """
 
 import pytest
@@ -12,33 +12,31 @@ from app.memory.store import MemoryStore
 from app.memory.writer import _parse_facts, extract_facts, remember
 
 
-# --- fake Anthropic client ---
+# --- fake agent_runtime runner ---
+#
+# The writer streams and joins rather than calling `run()`, because `run()` drives
+# the sentence splitter — right for speech, wrong for a JSON array. The fake
+# therefore yields the response in fragments, which is also how a real model
+# streams one.
 
-class _Block:
-    type = "text"
-
-    def __init__(self, text):
-        self.text = text
-
-
-class _Resp:
-    def __init__(self, text):
-        self.content = [_Block(text)]
-
-
-class FakeMessages:
-    def __init__(self, text):
+class FakeRunner:
+    def __init__(self, text, *, model=None):
         self._text = text
-        self.last_kwargs = None
+        self.model = model
+        self.calls = []
 
-    async def create(self, **kwargs):
-        self.last_kwargs = kwargs
-        return _Resp(self._text)
+    def stream(self, messages, *, system=None, conversation_id=None, depth=0):
+        self.calls.append(
+            {"messages": messages, "system": system, "conversation_id": conversation_id}
+        )
 
+        async def gen():
+            # Split mid-string so a writer that assumed one whole chunk would fail.
+            half = len(self._text) // 2
+            yield self._text[:half]
+            yield self._text[half:]
 
-class FakeClient:
-    def __init__(self, text):
-        self.messages = FakeMessages(text)
+        return gen()
 
 
 def _settings(**over):
@@ -86,22 +84,22 @@ def test_parse_facts_respects_limit():
 # --- extract_facts ---
 
 async def test_extract_facts_uses_configured_model_and_parses():
-    client = FakeClient('["Is learning Spanish"]')
-    settings = _settings(memory_model="claude-test-model")
+    runner = FakeRunner('["Is learning Spanish"]')
+    settings = _settings(memory_tier="cheap")
 
     facts = await extract_facts(
-        "I'm learning Spanish", "That's great!", settings=settings, client=client
+        "I'm learning Spanish", "That's great!", settings=settings, runner=runner
     )
 
     assert facts == ["Is learning Spanish"]
-    assert client.messages.last_kwargs["model"] == "claude-test-model"
+    assert runner.calls[0]["system"]  # the extraction prompt was supplied
 
 
 async def test_extract_facts_short_circuits_on_empty_input():
-    client = FakeClient('["should not be used"]')
-    facts = await extract_facts("", "a reply", settings=_settings(), client=client)
+    runner = FakeRunner('["should not be used"]')
+    facts = await extract_facts("", "a reply", settings=_settings(), runner=runner)
     assert facts == []
-    assert client.messages.last_kwargs is None  # no LLM call made
+    assert runner.calls == []  # no LLM call made
 
 
 # --- remember ---

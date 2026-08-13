@@ -43,7 +43,7 @@ async def test_memory_block_reaches_the_brain_system_prompt(fake_io, monkeypatch
         block = "What you remember about your user:\n- Has a dog named Mango"
         return block, ["Has a dog named Mango"]
 
-    async def fake_think(messages, system=None):
+    async def fake_think(messages, system=None, **kw):
         seen["system"] = system
         yield "Hello there."
 
@@ -73,7 +73,7 @@ async def test_writer_called_with_exchange_after_turn(fake_io, monkeypatch):
     async def no_context(query=None, **kw):
         return None, []
 
-    async def fake_think(messages, system=None):
+    async def fake_think(messages, system=None, **kw):
         yield "Nice, Mango sounds lovely."
 
     async def spy_remember(user_text, reply, **kw):
@@ -94,7 +94,7 @@ async def test_writer_failure_does_not_break_the_turn(fake_io, monkeypatch):
     async def no_context(query=None, **kw):
         return None, []
 
-    async def fake_think(messages, system=None):
+    async def fake_think(messages, system=None, **kw):
         yield "All good."
 
     async def boom_remember(user_text, reply, **kw):
