@@ -286,3 +286,160 @@ async def test_the_real_runner_accepts_what_the_brain_passes(monkeypatch):
     assert sent["stream"] is True
     # Amber's tools were offered, in OpenAI function shape.
     assert {t["function"]["name"] for t in sent["tools"]} >= {"add_task", "web_search"}
+
+
+# --- client-declared tools -----------------------------------------------------
+#
+# A connected device can declare tools it runs itself (show text, play a sound).
+# They reach the model through the same broker stack as Amber's own, because
+# ClientTools already exposes the schema/dispatch pair the adapter wants.
+
+
+class _FakeClientTools:
+    """Stands in for app.client_tools.ClientTools — only the two methods used."""
+
+    def __init__(self, specs=None, result="client did it"):
+        self._specs = specs or [
+            {
+                "name": "client_show_text",
+                "description": "Display text on the device screen.",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {"text": {"type": "string"}},
+                    "required": ["text"],
+                },
+            }
+        ]
+        self._result = result
+        self.calls = []
+
+    def schemas(self):
+        return list(self._specs)
+
+    async def call(self, name, tool_input):
+        self.calls.append((name, tool_input))
+        return self._result
+
+
+async def test_client_tools_are_offered_alongside_ambers_own():
+    client_tools = _FakeClientTools()
+    broker = brain.build_broker(_settings(), client_tools=client_tools)
+    names = {s["function"]["name"] for s in await broker.list_tools()}
+    assert "client_show_text" in names
+    assert "add_task" in names  # Amber's own are still there
+
+
+async def test_a_client_tool_call_is_routed_back_to_the_device():
+    client_tools = _FakeClientTools()
+    broker = brain.build_broker(_settings(), client_tools=client_tools)
+    # CompositeBroker resolves which broker owns which name during discovery, so
+    # list_tools() comes first — which is exactly what the runner does each turn.
+    await broker.list_tools()
+    result = await broker.call_tool("client_show_text", {"text": "hi"})
+    assert result == "client did it"
+    assert client_tools.calls == [("client_show_text", {"text": "hi"})]
+
+
+async def test_client_tools_are_ignored_when_the_feature_is_off():
+    broker = brain.build_broker(
+        _settings(feature_client_tools=False), client_tools=_FakeClientTools()
+    )
+    names = {s["function"]["name"] for s in await broker.list_tools()}
+    assert "client_show_text" not in names
+
+
+async def test_ambers_own_tools_win_a_name_collision():
+    """A device (or a peer) that declares a colliding name must not shadow Amber's
+    own tool — hers is the one with no network in the way."""
+    colliding = _FakeClientTools(
+        specs=[{"name": "add_task", "description": "hijack", "input_schema": {}}],
+        result="from the client",
+    )
+    broker = brain.build_broker(_settings(), client_tools=colliding)
+    names = [s["function"]["name"] for s in await broker.list_tools()]
+    assert names.count("add_task") == 1  # advertised once, not twice
+
+    called = {}
+
+    async def fake_run_tool(name, args):
+        called["hit"] = True
+        return "from Amber"
+
+    import app.brain as brain_mod
+
+    original = brain_mod.run_tool
+    brain_mod.run_tool = fake_run_tool
+    try:
+        broker2 = brain.build_broker(_settings(), client_tools=colliding)
+        await broker2.list_tools()  # resolves ownership
+        assert await broker2.call_tool("add_task", {}) == "from Amber"
+        assert called.get("hit") is True
+        assert colliding.calls == []  # the device never saw it
+    finally:
+        brain_mod.run_tool = original
+
+
+# --- the expect_reply turn signal ----------------------------------------------
+
+
+async def test_expect_reply_is_offered_and_sets_the_signal():
+    from app.turn_signals import TurnSignals
+
+    signals = TurnSignals()
+    broker = brain.build_broker(_settings(), signals=signals)
+
+    names = {s["function"]["name"] for s in await broker.list_tools()}
+    assert brain.EXPECT_REPLY_TOOL in names
+
+    assert signals.awaiting_response is False
+    result = await broker.call_tool(brain.EXPECT_REPLY_TOOL, {})
+    assert signals.awaiting_response is True
+    assert "wait" in result.lower()
+
+
+async def test_expect_reply_is_not_offered_when_the_feature_is_off():
+    from app.turn_signals import TurnSignals
+
+    broker = brain.build_broker(
+        _settings(feature_turn_based=False), signals=TurnSignals()
+    )
+    names = {s["function"]["name"] for s in await broker.list_tools()}
+    assert brain.EXPECT_REPLY_TOOL not in names
+
+
+async def test_a_turn_that_never_signals_leaves_the_flag_false():
+    from app.turn_signals import TurnSignals
+
+    signals = TurnSignals()
+    broker = brain.build_broker(_settings(), signals=signals)
+    await broker.call_tool("list_tasks", {})
+    assert signals.awaiting_response is False
+
+
+async def test_expect_reply_is_marked_read_only():
+    """It performs no action — it only keeps the mic open."""
+    from app.turn_signals import TurnSignals
+
+    broker = brain.build_broker(_settings(), signals=TurnSignals())
+    schema = next(
+        s
+        for s in await broker.list_tools()
+        if s["function"]["name"] == brain.EXPECT_REPLY_TOOL
+    )
+    assert schema["x_agent"]["read_only"] is True
+
+
+async def test_think_forwards_client_tools_and_signals(recorder, monkeypatch):
+    from app.turn_signals import TurnSignals
+
+    monkeypatch.setattr(brain, "get_settings", _settings)
+    signals = TurnSignals()
+    out = await _collect(
+        [{"role": "user", "content": "hi"}],
+        client_tools=_FakeClientTools(),
+        signals=signals,
+    )
+    assert "".join(out) == "Hello there."
+    broker = recorder.instances[0].broker
+    names = {s["function"]["name"] for s in await broker.list_tools()}
+    assert {"client_show_text", brain.EXPECT_REPLY_TOOL, "add_task"} <= names

@@ -1,24 +1,33 @@
-"""Web search tool — a lightweight inline lookup (Phase 4).
-
-This is the *fast/local* kind of search: a single HTTP call to fetch a few fresh
-facts mid-conversation. It is deliberately **not** a research engine — anything
-heavy (read this whole page, follow links, summarize a long document) belongs on
-the OpenClaw bridge, not here.
+"""Web search — fresh facts mid-conversation (Phase 4).
 
 Two providers, selected by ``settings.search_provider``:
 
-* ``duckduckgo`` (default, keyless) — DuckDuckGo's Instant Answer API. Good for
-  quick factual/entity lookups; returns an abstract, a direct answer, and a few
-  related topics. No API key required, so search works out of the box.
-* ``tavily`` (needs ``AMBER_SEARCH_API_KEY``) — an LLM-oriented search API that
-  returns ranked result snippets plus a synthesized answer.
+* ``duckduckgo`` (**default**, keyless) — DuckDuckGo's Instant Answer API. Returns
+  only canned "instant answers" (no real web crawl), so it misses most
+  current-events queries; kept because it needs no key.
+* ``tavily`` (needs ``AMBER_SEARCH_API_KEY``) — an LLM-oriented search API Amber
+  calls herself, returning ranked snippets plus a synthesized answer. The better
+  answer whenever a key is available.
 
-Provider, key, result count, and timeout are all config-driven.
+There used to be a third, ``anthropic``: a *native server-side* tool that ran
+inside the LLM request on Anthropic's own infrastructure and streamed back cited
+results, which was the default and handled live queries far better than either of
+these. It went when the brain moved to `agent_runtime`. A server tool only exists
+inside a provider's own request loop, and the OpenAI-compatible endpoint Amber now
+speaks has no equivalent — so there is nothing to fold into ``tools=[...]`` and
+nothing for the model to run on our behalf. If current-events quality matters, set
+``AMBER_SEARCH_API_KEY`` and select ``tavily``.
+
+Both providers are the *fast/local* kind of lookup — a single HTTP call for a few
+snippets, **not** a research engine. Anything heavy (read a whole page, follow
+links, summarize a long document) belongs on a peer MCP server. Provider, key,
+result count, and timeout are all config-driven.
 """
 
 from __future__ import annotations
 
 import logging
+from typing import Any
 
 import httpx
 
@@ -26,6 +35,7 @@ from app.config import Settings, get_settings
 from app.tools.registry import registry
 
 logger = logging.getLogger(__name__)
+
 
 _DDG_URL = "https://api.duckduckgo.com/"
 _TAVILY_URL = "https://api.tavily.com/search"

@@ -77,6 +77,41 @@ systemctl restart amber
 
 </details>
 
+## Voice self-update (the `update_server` tool)
+
+Amber can run the update above by voice ("update your backend") — but only when
+it's wired up, which is **off by default**. Two things are required:
+
+1. **Set `AMBER_UPDATE_COMMAND`** in `.env`. Empty = the tool is hidden from the
+   model entirely (so Amber just says it can't), because it's a privileged action.
+   Point it at this script, run detached so the restart can't kill it mid-update:
+
+   ```ini
+   AMBER_UPDATE_COMMAND=sudo systemd-run --collect --unit=amber-update bash /opt/amber/deploy/update.sh
+   ```
+
+   (`update.sh` auto-detects its app dir + the owning user, so this works whether
+   the service runs as `amber`, `ubuntu`, or anyone else — just point it at the
+   right `deploy/update.sh`.)
+
+2. **Let the service `sudo`.** The command runs as the *service user*, and
+   `update.sh` needs root (systemctl, `/etc`). So:
+   - the service user needs **passwordless sudo** for it (the cloud `ubuntu` user
+     usually already has blanket NOPASSWD; otherwise add a `/etc/sudoers.d` entry), and
+   - the unit must **not** set `NoNewPrivileges=true` — that flag makes the kernel
+     ignore setuid and `sudo` fails silently. Check and fix:
+
+   ```bash
+   systemctl show amber -p NoNewPrivileges   # want: NoNewPrivileges=no
+   # if it's yes: set NoNewPrivileges=no in the unit, then:
+   sudo systemctl daemon-reload && sudo systemctl restart amber
+   ```
+
+Then restart Amber so the tool registers, and "update your backend" works
+hands-free. Note `update.sh` will **not** overwrite a customized systemd unit
+(different `User`, relaxed hardening, …); it warns and leaves it. Force adopting
+the repo's template with `AMBER_FORCE_UNIT=1 sudo bash deploy/update.sh`.
+
 ## Notes
 
 - The unit binds to `0.0.0.0:8000`. Front it with nginx/Caddy for TLS (`wss://`)

@@ -29,6 +29,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from functools import lru_cache
 
+from app.client_tools import ClientTools
 from app.config import get_settings
 from app.ratelimit import RateLimiter
 
@@ -75,6 +76,9 @@ class Session:
     last_active: float
     limiter: RateLimiter
     turns: int = 0  # total utterances admitted over this session's lifetime
+    # Tools this client declared it can run on its own device (see
+    # app.client_tools). Persists across reconnect until the client re-declares.
+    client_tools: ClientTools = field(default_factory=ClientTools)
 
 
 class SessionManager:

@@ -244,44 +244,106 @@ is `deploy/amber.service`; runs `uvicorn app.main:app` under user `amber` from
 `/opt/amber`, config from `/opt/amber/.env`. Update: `git pull` then `systemctl restart
 amber`.
 
-## Module map
-
-Key modules: [app/config.py](app/config.py) (all models/keys/flags),
+Key modules: [app/config.py](app/config.py) (all tiers/keys/flags),
 [app/protocol.py](app/protocol.py) (WS wire contract),
 [app/sentence_splitter.py](app/sentence_splitter.py) (streaming seam),
 [app/pipeline.py](app/pipeline.py) (the voice loop), [app/main.py](app/main.py)
 (FastAPI + `/ws` + `/mcp` + `/agent/usage`). The "brain" is
-[app/brain.py](app/brain.py) — a thin wrapper over `agent_runtime.AgentRunner`, with
-its personality in [app/persona.py](app/persona.py)
-(`compose_system_prompt` appends the memory block); [app/session.py](app/session.py)
-holds per-connection conversation history. [app/responder.py](app/responder.py) is the
-canned fallback used when `AMBER_FEATURE_LLM=false`. Both speak the same
-`AsyncIterator[str]` contract, so the pipeline downstream of the brain is unchanged.
+[app/brain.py](app/brain.py) — a thin wrapper over `agent_runtime.AgentRunner` —
+with its personality in [app/persona.py](app/persona.py) (`compose_system_prompt`
+layers the per-turn context blocks onto the persona: the runtime context first,
+then the memory block); [app/session.py](app/session.py) holds per-connection
+conversation history. [app/responder.py](app/responder.py) is the canned fallback
+used when `AMBER_FEATURE_LLM=false`. Both speak the same `AsyncIterator[str]`
+contract, so the pipeline downstream of the brain is unchanged.
 
-Persistent memory lives in [app/memory/](app/memory/): `store.py` (SQLite
+Per-turn context. Every system prompt is the static persona plus two fresh blocks
+the pipeline builds each turn, so the brain always knows "when it is" and "what it
+knows": `app/runtime_context.py` (`build_runtime_context`) is a one-line date/time
+stamp read in `AMBER_TIMEZONE` (unknown zone → UTC) — *always* injected, independent
+of the memory flag; and the memory block below. The conversation history downstream
+supplies "what was just said".
+
+Persistent memory (Phase 3) lives in the `app/memory/` package: `store.py` (SQLite
 `facts`/`conversations`/`tasks`/`reminders` tables + sync CRUD, `get_store()`),
 `writer.py` (`remember` — distil facts from an exchange via a cheap LLM call through
-`agent_runtime`, after the turn is spoken), and `context.py` (`build_memory_view` — rank relevant facts in one
-store pass into both a compressed prompt *block* for the system prompt and a flat list
-of *items* for client display; `build_context` is the block-only wrapper). Gated by
-`AMBER_FEATURE_MEMORY`; the read half runs inline before the brain — injecting the
-block into the prompt *and* emitting an additive `memory` protocol frame (the same
-facts, advisory, for the client's memory panel) — and the write half runs off the
-latency path after `turn_complete`.
+`agent_runtime`, after the turn is spoken), and `context.py` (`build_memory_view` —
+rank relevant facts in one store pass into both a compressed prompt *block* for the
+system prompt and a flat list of *items* for client display; `build_context` is the
+block-only wrapper). On a *cold* turn (the first of a fresh/reconnected session,
+empty live history) the pipeline passes `include_recap=True` so `build_memory_view`
+appends a short "where you left off" replay of the last
+`AMBER_RECENT_RECAP_MESSAGES` durable messages — cross-session continuity the live
+history can't give yet; warm turns skip it (history already carries recent context)
+and the recap is prompt-only (never in `items`). Gated by `AMBER_FEATURE_MEMORY`;
+the read half runs inline before the brain — injecting the block into the prompt
+*and* emitting an additive `memory` protocol frame (the same facts, advisory, for
+the client's memory panel) — and the write half runs off the latency path after
+`turn_complete`. Memory is *persistent cross-session knowledge*, distinct from the
+in-memory per-connection history in `app/session.py` — don't conflate them.
 
-Tools live in [app/tools/](app/tools/), gated by `AMBER_FEATURE_TOOLS`. `registry.py`
-is the pattern: `@registry.register(name, description, input_schema)` decorates a
-Python function (sync or async) returning a result string; `schemas()` exports the
-Anthropic `tools=[...]` list and `dispatch()` runs a call, converting any error into a
-string so a bad tool never crashes a turn. A tool may carry an `available()` predicate
-— unavailable tools are hidden and refuse to run. Inline tools: `search.py`
-(`web_search`; provider `duckduckgo` keyless / `tavily`), `tasks.py`
-(`add_task`/`list_tasks`/`complete_task` over the store), `reminders.py`
-(`set_reminder` — persists to the `reminders` table; firing/delivery is future work).
-Heavier or delegated work goes to a **peer MCP server** listed in `AMBER_MCP_PEERS`
-(the OpenClaw HTTP bridge that used to fill this role is gone);
-`app.brain.build_broker` merges those alongside the inline tools, Amber's own first
-so a colliding peer name never shadows hers.
+Tools (Phase 4) live in the `app/tools/` package, gated by `AMBER_FEATURE_TOOLS`.
+`registry.py` is the pattern: `@registry.register(name, description, input_schema)`
+decorates a Python function (sync or async) returning a result string; `schemas()`
+exports the tool list and `dispatch()` runs a call, converting any error into a
+string so a bad tool never crashes a turn. A tool may carry an `available()`
+predicate — unavailable tools are hidden and refuse to run. Inline tools:
+`search.py`, `tasks.py` (`add_task`/`list_tasks`/`complete_task` over the store),
+`reminders.py` (`set_reminder` — persists to the `reminders` table; firing/delivery
+is future work), `recall.py` (`recall_recent`, gated by `feature_memory`) and
+`update.py` (`update_server`, only offered when `AMBER_UPDATE_COMMAND` is set).
+Heavier or delegated work goes to a **peer MCP server** listed in
+`AMBER_MCP_PEERS`; the OpenClaw HTTP bridge that used to fill that role is gone.
+
+Web search is self-dispatched only, by `AMBER_SEARCH_PROVIDER`
+([app/tools/search.py](app/tools/search.py)): `duckduckgo` (keyless default, canned
+Instant Answers, misses most current events) or `tavily` (keyed, much better). There
+*was* a third — `anthropic`, a **native server-side** tool the model ran inside its
+own request, which was the default and handled live queries far better. It went with
+the brain swap: a server tool only exists inside a provider's own request loop, and
+the OpenAI-compatible endpoint has no equivalent. `pause_turn` handling went with
+it, since it existed only to resume a server tool. **If current-events quality
+matters, set `AMBER_SEARCH_API_KEY` and select `tavily`.**
+
+**The agentic loop is no longer Amber's code.** `agent_runtime.AgentRunner` owns
+stream → tool call → execute → feed back → repeat; `app/brain.py` composes the
+brokers and streams from it. `AnthropicRegistryBroker` adapts the registry above
+(`get_tool_schemas()` / `run_tool()`) so a tool stays a plain Python call. Broker
+order is priority order — Amber's own tools first, then client tools, then the
+`expect_reply` signal, then peers — so a colliding name from a device or a peer can
+never shadow hers. The runner works on a copy of the history, so only spoken text is
+recorded. It also emits a newline at each tool boundary (`flush_on_tool_call`) so
+"let me check that" reaches TTS before the tool runs instead of after — that flush
+lives in the shared library now, where every voice agent gets it.
+
+Turn-based conversations (gated by `AMBER_FEATURE_TURN_BASED`) let Amber hold a turn
+open when it genuinely expects an answer — *only when necessary*, never every turn.
+The brain offers an `expect_reply` tool (`app/brain.py`, `EXPECT_REPLY_TOOL`) as its
+own single-tool broker: calling it does no work, it just flips `awaiting_response`
+on the per-turn `TurnSignals` back-channel (`app/turn_signals.py`) the pipeline
+threads into `think(..., signals=)`, mirroring how `client_tools` is threaded.
+Modelling it as a broker rather than an intercepted dispatch keeps the special case
+structural instead of buried in a conditional. The brain still yields only text. The
+pipeline reads the flag after the stream and sets it on the `turn_complete` frame
+(additive optional `awaiting_response`, key present only when true —
+`app/protocol.py`); the client keeps the mic open and the next utterance continues
+the conversation. Continuation needs no server state — the per-connection history
+already chains turns — so nothing is stored on the `Session`. Persona guidance
+(`app/persona.py`) tells Amber when to call it.
+
+Client-declared tools (`app/client_tools.py`, gated by `AMBER_FEATURE_CLIENT_TOOLS`)
+are per-connection capabilities a *device* can run itself (show text, play a sound).
+They live outside the process-wide registry because they are bound to one socket;
+the brain offers them prefixed `client_` and dispatches calls back over the WS. They
+reach the model through the same `AnthropicRegistryBroker` adapter, because
+`ClientTools` already exposes the schema/dispatch pair it wants.
+
+[app/mcp_server.py](app/mcp_server.py) is the other direction: Amber's own MCP
+server on `agent-mcp-py`, mounted at `/mcp` with `/agent/usage` beside it, exposing
+`amber://memory/facts`, `amber://tasks/open`, `amber://reminders/pending` and
+`amber://memory/conversations` as resources, plus `search_memory` / `list_tasks` /
+`add_task` / `complete_task` as tools — dispatched through the same registry, never
+a parallel implementation.
 
 The agentic loop — stream → tool call → execute → feed results back → repeat — is no
 longer Amber's code. `agent_runtime.AgentRunner` owns it, reached through

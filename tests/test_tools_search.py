@@ -128,3 +128,45 @@ async def test_http_error_degrades_gracefully(monkeypatch):
 
     out = await search.web_search("anything")
     assert "unavailable" in out.lower()
+
+
+# --- native ("anthropic") server-side provider ---------------------------------
+
+def test_the_native_server_side_provider_is_gone():
+    """It was the default, and it was better: Anthropic ran the search inside the
+    LLM request and streamed back cited results, which handled live queries the
+    keyless API cannot. It went when the brain moved to `agent_runtime` — a server
+    tool only exists inside a provider's own request loop, and the
+    OpenAI-compatible endpoint has no equivalent. Recorded as a deliberate removal
+    so nobody re-adds half of it: there is no schema to export and nothing for the
+    model to run on our behalf.
+
+    Set AMBER_SEARCH_API_KEY and select "tavily" for comparable quality.
+    """
+    assert not hasattr(search, "server_tool_schemas")
+    assert not hasattr(search, "_inline_search_available")
+    assert not hasattr(search, "_native_search_selected")
+
+    from app.tools import get_tool_schemas
+    import app.tools as tools_pkg
+
+    assert not hasattr(tools_pkg, "get_server_tool_schemas")
+    # web_search is always a real, dispatchable tool now — never hidden behind a
+    # server tool that shares its name.
+    assert "web_search" in {s["name"] for s in get_tool_schemas()}
+
+
+async def test_an_unknown_provider_falls_back_to_the_keyless_one(monkeypatch):
+    captured = {}
+
+    async def fake_ddg(query, settings):
+        captured["hit"] = True
+        return ["a result"]
+
+    monkeypatch.setattr(search, "_duckduckgo", fake_ddg)
+    monkeypatch.setattr(
+        search, "get_settings", lambda: _settings(search_provider="anthropic")
+    )
+    out = await search.web_search("who won the world cup")
+    assert captured.get("hit") is True
+    assert "a result" in out

@@ -72,3 +72,23 @@ def test_empty_input_is_safe():
     s = SentenceSplitter()
     assert list(s.feed("")) == []
     assert list(s.flush()) == []
+
+
+def test_newline_is_a_hard_boundary():
+    """A newline flushes the buffered spoken unit — how the brain forces the
+    preamble out to TTS before a (slow) tool call instead of holding it."""
+    s = SentenceSplitter()
+    # A finished sentence with no trailing space is held (could be mid-stream).
+    assert list(s.feed("Let me check that.")) == []
+    # The injected newline flushes it immediately.
+    assert list(s.feed("\n")) == ["Let me check that."]
+    # The post-tool answer streams as usual.
+    assert list(s.feed("It's on Sunday.")) == []
+    assert list(s.flush()) == ["It's on Sunday."]
+
+
+def test_newline_flushes_even_without_terminator():
+    s = SentenceSplitter()
+    # No sentence punctuation at all — the newline alone ends the spoken unit.
+    assert list(s.feed("Let me check\n")) == ["Let me check"]
+    assert list(s.flush()) == []

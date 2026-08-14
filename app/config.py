@@ -49,6 +49,10 @@ class Settings(BaseSettings):
     host: str = "0.0.0.0"
     port: int = 8000
     log_level: str = "INFO"
+    # IANA timezone the brain's clock is read in (e.g. "America/New_York"). Drives
+    # the date/time line injected into every system prompt (app/runtime_context.py).
+    # An unknown/unavailable zone degrades to UTC rather than failing a turn.
+    timezone: str = "UTC"
 
     # --- Models (swappable) ---
     stt_model: str = "whisper-1"
@@ -81,18 +85,40 @@ class Settings(BaseSettings):
     # Hard cap on new facts kept from a single exchange, so one turn can't flood
     # the store.
     memory_max_new_facts: int = 5
+    # On a *cold* turn (the first of a fresh/reconnected session, when the live
+    # in-memory history is empty), how many of the most recent durable messages to
+    # replay into the prompt as a "where you left off" recap — cross-session
+    # continuity the live history can't provide yet. Skipped once the session has
+    # its own history (which already covers recent context). 0 disables the recap.
+    recent_recap_messages: int = 8
+    # How many recent durable messages the ``recall_recent`` tool returns when the
+    # user refers back to an earlier conversation (turn-based conversations). Off the
+    # per-turn path — paid only on turns where the model actually calls the tool —
+    # so it can be larger than the always-on recap above.
+    recall_messages: int = 12
 
     # --- Tools (Phase 4) ---
     # Max tool-use round trips the brain will make in one turn before it must
     # answer with what it has. A backstop against a model that loops on tools.
     max_tool_iterations: int = 5
-    # Web search (inline tool). Provider selects the backend:
-    #   "duckduckgo" — keyless Instant Answer API (default; quick factual lookups)
-    #   "tavily"     — LLM-oriented search; requires search_api_key.
+    # Web search. The provider selects the backend:
+    #   "duckduckgo" — keyless Instant Answer API Amber calls itself (default).
+    #                  Returns only canned "instant answers" (no real web crawl), so
+    #                  it misses most current-events queries — but it needs no key.
+    #   "tavily"     — LLM-oriented search API Amber calls itself; needs
+    #                  search_api_key. The better answer when a key is available.
+    #
+    # There used to be a third, "anthropic": a *native server-side* tool Anthropic
+    # ran inside the LLM request, which was the default and was far better for
+    # current events. It went when the brain moved to `agent_runtime` — a server
+    # tool lives inside the provider's own request loop, and the OpenAI-compatible
+    # endpoint has no equivalent. Both remaining providers are ordinary inline tools
+    # Amber dispatches herself. Set `search_api_key` and pick "tavily" to get
+    # comparable quality back.
     search_provider: str = "duckduckgo"
     search_api_key: str = ""
-    # Hard cap on result snippets folded into one tool result (kept small — the
-    # model pays for them in tokens, and voice answers are short).
+    # Self-dispatched providers (tavily/duckduckgo): hard cap on result snippets
+    # folded into one tool result (kept small — the model pays for them in tokens).
     search_max_results: int = 3
     search_timeout_s: float = 10.0
     # Peer MCP servers Amber may call as a client, as "name=https://host" pairs.
@@ -101,6 +127,24 @@ class Settings(BaseSettings):
     # means Amber has no peers and uses inline tools only.
     mcp_peers: str = ""
     mcp_peer_token: str = ""
+    # ``update_server`` tool — runs the deploy update script on the box. The tool is
+    # only offered to the model when this command is set (empty = hidden), since it
+    # is a privileged, server-mutating action. The command is run through a shell.
+    # NOTE: the script restarts the amber service; configure it to run detached from
+    # the service cgroup (e.g. via ``systemd-run``) so the restart doesn't kill the
+    # update mid-flight — see .env.example.
+    update_command: str = ""
+    # How long to wait for the update command before giving up and returning to the
+    # model (the detached script keeps running regardless).
+    update_timeout_s: float = 120.0
+    # Client-provided tools (see app/client_tools.py). A client may declare tools it
+    # can run on its own device (text display, sounds, ...); Amber offers them to the
+    # model prefixed with ``client_`` and dispatches calls back over the WS.
+    # Hard cap on tools one client may register, to bound prompt token cost.
+    max_client_tools: int = 16
+    # How long the brain waits for a client to return a tool result before giving up
+    # on that call and telling the model it failed.
+    client_tool_timeout_s: float = 30.0
 
     # --- Feature flags ---
     feature_stt: bool = True
@@ -113,6 +157,15 @@ class Settings(BaseSettings):
     # When false, the brain never offers tools to the model — it streams a direct
     # reply exactly as Phase 2/3. Lets the loop run without any tool plumbing.
     feature_tools: bool = True
+    # When false, client-declared tools are ignored — the brain never offers them
+    # and never calls back to the client. Independent of ``feature_tools`` (which
+    # governs Amber's own server-side tools).
+    feature_client_tools: bool = True
+    # Turn-based conversations: when true, the brain offers the ``expect_reply``
+    # signaling tool so Amber can deliberately hold a turn open for the user's
+    # answer (``turn_complete`` then carries ``awaiting_response``). When false the
+    # tool is never advertised and the field is never sent — identical to before.
+    feature_turn_based: bool = True
     # When false, Amber's own MCP server is not mounted. She stays a *caller* of
     # other agents either way; this only controls whether she is queryable herself.
     feature_mcp_server: bool = True

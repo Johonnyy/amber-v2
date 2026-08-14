@@ -1,52 +1,60 @@
-"""The brain — a streamed token source, now driven by `agent_runtime`.
+"""The brain — a streamed token source, driven by `agent_runtime`.
 
 The contract is unchanged and deliberately so: ``think()`` returns an
 ``AsyncIterator[str]`` of text deltas, exactly as `app.responder.respond` does, so
 the sentence splitter downstream can start TTS on the first sentence before the
-whole response exists. Everything from the splitter onwards is untouched by this
-module's rewrite.
+whole response exists. Everything from the splitter onwards is untouched.
 
-What changed underneath is the loop. Amber used to drive the Anthropic Messages
-API herself — stream a turn, spot ``tool_use``, run the tools, feed results back,
+What changed underneath is the loop. Amber used to drive the Anthropic Messages API
+herself — stream a turn, spot ``tool_use``, run the tools, feed results back,
 repeat — and that loop is the thing every agent in the ecosystem needs, so it now
-lives in `agent_runtime` and Amber imports it. The `anthropic` SDK is gone from
-this app entirely; the provider is OpenRouter, reached through the standard
-OpenAI-compatible client.
+lives in `agent_runtime` and Amber imports it. The `anthropic` SDK is gone; the
+provider is OpenRouter, reached through the standard OpenAI-compatible client.
 
-Three consequences worth knowing:
+**Three kinds of tool, one broker stack.** The runner does not care where a tool
+lives; it asks a `ToolBroker`. Amber composes hers in priority order:
 
-* **Model choice is a named tier.** ``settings.llm_tier`` ("balanced") is resolved
-  by `agent_runtime.model_router`, so upgrading the model every app uses is one
-  edit in the router rather than one per app. Today "balanced" resolves to the
-  Claude Haiku model Amber was already pinned to, so this is not a behaviour
-  change — only an indirection.
-* **Amber's tools are unchanged.** `AnthropicRegistryBroker` adapts the existing
-  `app.tools` registry — the same ``get_tool_schemas()`` / ``run_tool()`` pair, the
-  same functions — so a tool is still a plain Python call and Amber never makes an
-  HTTP request to herself to add a task. Peers, when configured, are merged in
-  alongside via `CompositeBroker`.
-* **Tool use is still invisible downstream.** The runner may make several round
-  trips before answering; only spoken text comes out of this iterator, and the
-  caller's history is never polluted with tool plumbing.
+1. *Her own registry* (`app.tools`) via `AnthropicRegistryBroker` — the same
+   functions the voice path has always called, so a tool stays a plain Python call
+   and Amber never makes an HTTP request to herself to add a task.
+2. *Client-declared tools* (`app.client_tools`), routed back over the WebSocket to
+   whatever device is connected. Same adapter, because `ClientTools` already
+   exposes the schema/dispatch pair the adapter wants.
+3. *The `expect_reply` signal*, which is not a tool at all — calling it just flips
+   a flag on this turn's `TurnSignals` so the pipeline keeps the mic open.
+4. *Peer MCP servers*, when configured, for heavy or delegated work.
+
+Amber's own tools come first so a colliding name from a client or a peer can never
+shadow them.
+
+**What this costs relative to the Anthropic-native brain.** Server-side web search
+(`web_search_20250305`) ran inside Anthropic's own request and has no equivalent on
+the OpenAI-compatible endpoint, so `search_provider` falls back to the
+self-dispatched `tavily` / `duckduckgo` providers. The `pause_turn` stop reason
+went with it — it only ever existed to resume a server tool. The one piece worth
+keeping was the newline flush at a tool boundary, and that now lives in
+`agent_runtime` (`flush_on_tool_call`) where every voice agent gets it.
 
 The runner is rebuilt per turn rather than cached, because the broker binds this
-turn's ``conversation_id`` and agent depth. That costs one small object; caching it
-would mean either leaking one conversation's id into the next or threading mutable
-state through a shared instance.
+turn's client tools, signals and conversation id. That costs one small object;
+caching it would mean leaking one turn's state into the next.
 """
 
 from __future__ import annotations
 
 import logging
 from collections.abc import AsyncIterator
+from typing import TYPE_CHECKING
 
 from agent_runtime import (
     AgentRunner,
     AnthropicRegistryBroker,
     CompositeBroker,
+    LocalToolBroker,
     MCPClient,
 )
 from agent_runtime import Settings as RuntimeSettings
+
 # The peer record shape is agent-mcp-py's to define — it owns registration and
 # resolution — so Amber parses her static peer list with its helper rather than
 # inventing a second format that would drift.
@@ -56,7 +64,24 @@ from app.config import Settings, get_settings
 from app.persona import SYSTEM_PROMPT
 from app.tools import get_tool_schemas, run_tool
 
+if TYPE_CHECKING:
+    from app.client_tools import ClientTools
+    from app.turn_signals import TurnSignals
+
 logger = logging.getLogger(__name__)
+
+# Turn-based conversations: a signaling tool the model calls to keep a turn open.
+# Advertised like any other tool, but it does nothing except flip a flag — it is
+# never routed to the registry.
+EXPECT_REPLY_TOOL = "expect_reply"
+_EXPECT_REPLY_DESCRIPTION = (
+    "Signal that you're waiting for the user's answer and the conversation "
+    "should stay open for their reply. Call this ONLY when you genuinely need "
+    "them to respond — a real clarifying question, or a back-and-forth you're "
+    "steering. Never for rhetorical questions, asides, or ordinary replies; "
+    "most turns just end. Speak your question as normal text; this only keeps "
+    "the mic open for their answer."
+)
 
 
 def runtime_settings(settings: Settings | None = None) -> RuntimeSettings:
@@ -82,30 +107,75 @@ def runtime_settings(settings: Settings | None = None) -> RuntimeSettings:
     )
 
 
-def build_broker(settings: Settings | None = None):
-    """Assemble the tool broker for a turn, or ``None`` when tools are off.
+def _signal_broker(signals: "TurnSignals") -> LocalToolBroker:
+    """A one-tool broker for ``expect_reply``.
 
-    Amber's inline tools come first so that if a peer ever exposes a colliding
-    name, hers wins — her own tools are the ones with no network in the way.
+    Modelled as a tool because that is the only channel the model has, but it does
+    no work: it sets the flag and acknowledges. Keeping it in its own broker means
+    the interception is structural rather than a special case buried in dispatch.
+    """
+    broker = LocalToolBroker()
+
+    def expect_reply() -> str:
+        signals.awaiting_response = True
+        return "OK — I'll wait for their reply."
+
+    broker.register(
+        EXPECT_REPLY_TOOL,
+        _EXPECT_REPLY_DESCRIPTION,
+        {"type": "object", "properties": {}},
+        expect_reply,
+        read_only=True,
+    )
+    return broker
+
+
+def build_broker(
+    settings: Settings | None = None,
+    *,
+    client_tools: "ClientTools | None" = None,
+    signals: "TurnSignals | None" = None,
+):
+    """Assemble this turn's tool broker, or ``None`` when there is nothing to offer.
+
+    Order is priority order: Amber's own tools resolve first, so a client or peer
+    that declares a colliding name cannot shadow them.
     """
     settings = settings or get_settings()
-    if not settings.feature_tools:
+    brokers: list = []
+
+    if settings.feature_tools:
+        brokers.append(AnthropicRegistryBroker(get_tool_schemas, run_tool))
+
+    if settings.feature_client_tools and client_tools is not None:
+        # ClientTools already exposes exactly the schema/dispatch pair the adapter
+        # wants, so the same adapter serves both. `schemas` is passed as a callable
+        # because the connected device can redeclare its tools at any time.
+        brokers.append(
+            AnthropicRegistryBroker(client_tools.schemas, client_tools.call)
+        )
+
+    if settings.feature_turn_based and signals is not None:
+        brokers.append(_signal_broker(signals))
+
+    if settings.feature_tools:
+        peers = load_static_peers(settings.mcp_peers, settings.mcp_peer_token)
+        if peers:
+            brokers.append(MCPClient(list(peers), resolver=peers))
+
+    if not brokers:
         return None
-
-    local = AnthropicRegistryBroker(get_tool_schemas, run_tool)
-
-    peers = load_static_peers(settings.mcp_peers, settings.mcp_peer_token)
-    if not peers:
-        return local
-
-    remote = MCPClient(list(peers), resolver=peers)
-    return CompositeBroker([local, remote])
+    if len(brokers) == 1:
+        return brokers[0]
+    return CompositeBroker(brokers)
 
 
 async def think(
     messages: list[dict],
     system: str | None = None,
     *,
+    client_tools: "ClientTools | None" = None,
+    signals: "TurnSignals | None" = None,
     conversation_id: str | None = None,
 ) -> AsyncIterator[str]:
     """Stream Amber's reply for the given conversation history.
@@ -117,16 +187,20 @@ async def think(
     block appended (see `app.persona.compose_system_prompt`), falling back to the
     bare persona prompt.
 
-    ``conversation_id`` is the session id. It ties this turn's model spend and tool
-    calls together in the usage tables, and is forwarded to any peer agent Amber
-    calls so a multi-agent exchange can be reconstructed afterwards.
+    ``client_tools`` is the connection's declared client-side tools, offered
+    alongside Amber's own and dispatched back over the WebSocket. ``signals`` is the
+    per-turn back-channel: when the model calls ``expect_reply`` the flag flips and
+    the pipeline keeps the turn open. ``conversation_id`` is the session id, tying
+    this turn's model spend and tool calls together in the usage tables and
+    forwarded to any peer agent Amber calls.
 
     Yields text deltas as they arrive. Tool round trips happen inside and are
-    invisible here.
+    invisible here, apart from a newline at each tool boundary so speech before a
+    tool reaches TTS without waiting for the tool to finish.
     """
     settings = get_settings()
     system = system if system is not None else SYSTEM_PROMPT
-    broker = build_broker(settings)
+    broker = build_broker(settings, client_tools=client_tools, signals=signals)
 
     runner = AgentRunner(
         model=settings.llm_tier,

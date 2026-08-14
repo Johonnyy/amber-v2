@@ -31,6 +31,8 @@ def test_env_overrides(monkeypatch):
 def test_tool_defaults():
     s = _fresh()
     assert s.feature_tools is True
+    # Self-dispatched search: the native Anthropic server tool went with the brain
+    # swap, since a server tool only exists inside a provider's own request loop.
     assert s.search_provider == "duckduckgo"
     assert s.mcp_peers == ""  # no peer agents until configured
     assert s.max_tool_iterations == 5
@@ -51,6 +53,23 @@ def test_openclaw_is_gone():
     s = _fresh()
     for removed in ("openclaw_url", "openclaw_token", "openclaw_timeout_s"):
         assert not hasattr(s, removed)
+
+
+def test_native_search_config_is_gone_with_the_server_tool():
+    """`search_tool_version`/`search_max_uses` only ever configured Anthropic's
+    native server tool. Leaving them would imply a knob that does nothing."""
+    s = _fresh()
+    for removed in ("search_tool_version", "search_max_uses"):
+        assert not hasattr(s, removed)
+
+
+def test_turn_based_defaults():
+    s = _fresh()
+    assert s.feature_turn_based is True
+    assert s.feature_client_tools is True
+    assert s.recall_messages == 12
+    # Cold-start recap was bumped for richer cross-session continuity.
+    assert s.recent_recap_messages == 8
 
 
 def test_auth_enabled_follows_secret():

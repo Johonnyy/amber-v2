@@ -23,10 +23,16 @@ ExecStart=/opt/amber/.venv/bin/uvicorn app.main:app --host 0.0.0.0 --port 8000
 Restart=on-failure
 RestartSec=3
 
-# Hardening
+# Hardening.
+# NOTE: NoNewPrivileges=true blocks the voice self-update (update_server), because
+# the update command has to `sudo` to restart the service. If you want hands-free
+# backend updates, set this to `no` (update.sh's actual work runs in a separate,
+# detached systemd-run unit, so the running service stays otherwise sandboxed).
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=full
+# ProtectHome=true hides /home — keep the app OUT of /home (e.g. /opt/amber) or
+# the service can't read its own code. Set to `no` if the checkout lives in a home dir.
 ProtectHome=true
 
 [Install]

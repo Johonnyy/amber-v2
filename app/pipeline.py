@@ -28,6 +28,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from collections.abc import AsyncIterator, Awaitable, Callable
+from typing import TYPE_CHECKING
 
 from app import protocol
 from app.brain import think
@@ -35,10 +36,15 @@ from app.config import get_settings
 from app.memory import build_memory_view, remember
 from app.persona import compose_system_prompt
 from app.responder import respond
+from app.runtime_context import build_runtime_context
 from app.sentence_splitter import SentenceSplitter
 from app.session import Conversation
 from app.stt import transcribe
 from app.tts import synthesize
+from app.turn_signals import TurnSignals
+
+if TYPE_CHECKING:
+    from app.client_tools import ClientTools
 
 logger = logging.getLogger(__name__)
 
@@ -57,15 +63,18 @@ async def run_turn(
     send_json: SendJson,
     send_bytes: SendBytes,
     conversation: Conversation | None = None,
+    client_tools: "ClientTools | None" = None,
     *,
     conversation_id: str | None = None,
 ) -> int:
     """Process one user turn and stream the spoken reply back.
 
     ``conversation`` carries the per-connection history; if omitted a throwaway one
-    is used (single-turn, no memory). ``conversation_id`` is the session id, passed
-    down so this turn's model spend and tool calls are attributable to it in the
-    usage tables and so any peer agent Amber calls joins the same exchange.
+    is used (single-turn, no memory). ``client_tools`` is the connection's declared
+    client-side tools (Phase 4+), offered to the brain alongside Amber's own.
+    ``conversation_id`` is the session id, passed down so this turn's model spend
+    and tool calls are attributable to it in the usage tables, and so any peer agent
+    Amber calls joins the same exchange.
 
     Returns the number of sentences spoken. Raises on transport/API failure so the
     caller can emit an error frame; ``asyncio.CancelledError`` from an interrupt is
@@ -85,23 +94,27 @@ async def run_turn(
     # 2. Think -> stream -> speak.
     await send_json(protocol.thinking(True))
     reply = ""
+    # Turn-based conversations: did Amber ask something it expects an answer to?
+    # The canned/empty path never awaits; the brain path sets this via expect_reply.
+    awaiting = False
     try:
         if not transcript_text:
             # Nothing heard (silence, or STT disabled) — reprompt without spending
             # an LLM call or feeding the brain an empty user turn.
             spoken = await _speak_stream(_canned(_DIDNT_CATCH), send_json, send_bytes)
         else:
-            spoken, reply = await _think_and_speak(
+            spoken, reply, awaiting = await _think_and_speak(
                 transcript_text,
                 conversation,
                 send_json,
                 send_bytes,
+                client_tools,
                 conversation_id=conversation_id,
             )
     finally:
         await send_json(protocol.thinking(False))
 
-    await send_json(protocol.turn_complete(spoken))
+    await send_json(protocol.turn_complete(spoken, awaiting_response=awaiting))
 
     # 3. Write half of memory. Runs only after the audio + completion frame are
     # already sent, so a slow extraction can't delay speech. Best-effort: a failure
@@ -123,17 +136,26 @@ async def _think_and_speak(
     conversation: Conversation,
     send_json: SendJson,
     send_bytes: SendBytes,
+    client_tools: "ClientTools | None" = None,
     *,
     conversation_id: str | None = None,
-) -> tuple[int, str]:
+) -> tuple[int, str, bool]:
     """Record the user turn, stream a reply, and record what was spoken.
 
-    Returns ``(sentences_spoken, reply_text)``; the caller uses the reply to feed
-    the memory writer. The assistant turn is saved in a ``finally`` so an interrupt
-    mid-response still persists the partial reply — the next turn's context reflects
-    what the user actually heard.
+    Returns ``(sentences_spoken, reply_text, awaiting_response)``; the caller uses
+    the reply to feed the memory writer and the flag to set ``turn_complete``. The
+    assistant turn is saved in a ``finally`` so an interrupt mid-response still
+    persists the partial reply — the next turn's context reflects what the user
+    actually heard. ``awaiting_response`` is the brain's turn-based signal (the
+    model called ``expect_reply``); the canned ``respond`` fallback never sets it.
     """
     settings = get_settings()
+    signals = TurnSignals()
+    # A cold turn — the first of a fresh or reconnected session, before this user
+    # turn is recorded — has no live history yet, so the brain gets a "where you left
+    # off" recap from durable memory. Once the session has turns of its own they
+    # already carry recent context, so the recap is skipped to avoid replaying them.
+    cold_start = not conversation.messages
     conversation.add_user(transcript_text)
 
     # Phase 2: the brain. Fallback to the Phase-1 canned reply when the LLM is off
@@ -143,12 +165,21 @@ async def _think_and_speak(
         # prompt (the model's copy) and out to the client as a ``memory`` frame (the
         # user-visible copy), so the two can't drift. The frame is advisory; emitting
         # it before the reply streams lets a client show what Amber is drawing on.
-        memory_block, memory_items = await build_memory_view(transcript_text)
+        memory_block, memory_items = await build_memory_view(
+            transcript_text, include_recap=cold_start
+        )
         if memory_items:
             await send_json(protocol.memory(memory_items))
-        system = compose_system_prompt(memory_block)
+        # Ambient context (date/time) is rebuilt every turn and always injected,
+        # independent of the memory flag — Amber should always know when it is.
+        runtime_context = build_runtime_context()
+        system = compose_system_prompt(memory_block, runtime_context)
         tokens = think(
-            conversation.messages, system=system, conversation_id=conversation_id
+            conversation.messages,
+            system=system,
+            client_tools=client_tools,
+            signals=signals,
+            conversation_id=conversation_id,
         )
     else:
         tokens = respond(transcript_text)
@@ -163,7 +194,7 @@ async def _think_and_speak(
         reply = "".join(spoken_text).strip()
         if reply:
             conversation.add_assistant(reply)
-    return spoken, reply
+    return spoken, reply, signals.awaiting_response
 
 
 async def _remember_safe(user_text: str, reply: str) -> None:
