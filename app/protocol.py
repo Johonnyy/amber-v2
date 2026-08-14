@@ -39,6 +39,15 @@ call:
 A client that never sends ``register_tools`` is unaffected — no ``tool_call`` is
 ever sent to it.
 
+Typed input adds one more *additive* client -> server frame, ``user_text``: a turn
+whose text the client already has, so there is nothing to transcribe. It carries a
+single ``text`` field and is the exact peer of a binary utterance — it takes a turn
+slot, obeys the same rate limit and session cap, and barges in on an in-flight turn
+the same way. Everything downstream is identical: the server still echoes a
+``transcript`` frame (so a client renders both input modes through one path) and
+still speaks the reply. Only the STT step is skipped. Clients that only send audio
+are unaffected.
+
 Turn-based conversations extend ``turn_complete`` *additively* with an optional
 ``awaiting_response`` field: ``True`` when Amber asked something it expects the user
 to answer, so the client should keep the mic open and send the next utterance as a
@@ -52,6 +61,7 @@ from typing import Any
 
 # --- client -> server message types ---
 INTERRUPT = "interrupt"  # stop speaking mid-response
+USER_TEXT = "user_text"  # a typed utterance, taken verbatim instead of transcribed
 REGISTER_TOOLS = "register_tools"  # client declares tools Amber may call on it
 TOOL_RESULT = "tool_result"  # the result of a client-side tool call (see TOOL_CALL)
 

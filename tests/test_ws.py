@@ -225,3 +225,74 @@ def test_rate_limit_blocks_second_turn(faked_io, fresh_caches, monkeypatch):
         frame = ws.receive_json()
         assert frame["type"] == protocol.ERROR
         assert frame["code"] == protocol.ERR_RATE_LIMITED
+
+
+# --- typed turns (the ``user_text`` frame) ---
+
+def _read_transcript(ws) -> dict:
+    """Read frames until the transcript echo, returning it."""
+    for _ in range(50):
+        frame = ws.receive_json()
+        if frame["type"] == protocol.TRANSCRIPT:
+            return frame
+    raise AssertionError("never saw a transcript frame")
+
+
+def test_typed_turn_over_websocket(faked_io, fresh_caches):
+    """A user_text frame runs a full turn and echoes the typed words back."""
+    client = TestClient(app)
+    with client.websocket_connect("/ws") as ws:
+        _read_ready(ws)
+        ws.send_json({"type": protocol.USER_TEXT, "text": "  what time is it  "})
+
+        transcript = _read_transcript(ws)
+        assert transcript["text"] == "what time is it"  # echoed, whitespace stripped
+
+        complete = _drain_turn(ws)
+        assert complete["sentences"] >= 2  # spoken exactly like a voice turn
+
+
+def test_typed_turn_is_not_capped_by_audio_size(faked_io, fresh_caches, monkeypatch):
+    """max_audio_bytes governs audio only — a long typed message still gets through."""
+    monkeypatch.setenv("AMBER_MAX_AUDIO_BYTES", "8")
+    config_module.get_settings.cache_clear()
+    session_module.get_session_manager.cache_clear()
+
+    client = TestClient(app)
+    with client.websocket_connect("/ws") as ws:
+        _read_ready(ws)
+        ws.send_json({"type": protocol.USER_TEXT, "text": "x" * 500})
+        assert _read_transcript(ws)["text"] == "x" * 500
+
+
+def test_typed_turn_obeys_rate_limit(faked_io, fresh_caches, monkeypatch):
+    """Typed turns cost the same as spoken ones, so they hit the same limiter."""
+    monkeypatch.setenv("AMBER_RATE_LIMIT_TURNS", "1")
+    monkeypatch.setenv("AMBER_RATE_LIMIT_WINDOW_S", "60")
+    config_module.get_settings.cache_clear()
+    session_module.get_session_manager.cache_clear()
+
+    client = TestClient(app)
+    with client.websocket_connect("/ws") as ws:
+        _read_ready(ws)
+        ws.send_json({"type": protocol.USER_TEXT, "text": "first"})
+        _drain_turn(ws)
+
+        ws.send_json({"type": protocol.USER_TEXT, "text": "second"})
+        frame = ws.receive_json()
+        assert frame["type"] == protocol.ERROR
+        assert frame["code"] == protocol.ERR_RATE_LIMITED
+
+
+def test_blank_user_text_is_ignored(faked_io, fresh_caches):
+    """A blank/malformed user_text spends no turn — like any other bad control frame."""
+    client = TestClient(app)
+    with client.websocket_connect("/ws") as ws:
+        _read_ready(ws)
+        ws.send_json({"type": protocol.USER_TEXT, "text": "   "})
+        ws.send_json({"type": protocol.USER_TEXT, "text": 42})
+        ws.send_json({"type": protocol.USER_TEXT})
+
+        # The next real turn is the first thing that produces any frame at all.
+        ws.send_json({"type": protocol.USER_TEXT, "text": "for real"})
+        assert _read_transcript(ws)["text"] == "for real"

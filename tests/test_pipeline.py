@@ -249,3 +249,68 @@ async def test_run_turn_respects_stt_flag(fake_io, monkeypatch):
         assert transcript["text"] == ""
     finally:
         pipeline.get_settings.cache_clear()
+
+
+# --- typed turns (the ``user_text`` frame) ----------------------------------
+
+
+async def test_typed_text_skips_stt_and_echoes_transcript(fake_io, monkeypatch):
+    """A typed turn takes the client's words verbatim and never calls STT."""
+    calls = {"stt": 0}
+
+    async def counting_transcribe(audio, **kw):
+        calls["stt"] += 1
+        return "should not be called"
+
+    monkeypatch.setattr(pipeline, "transcribe", counting_transcribe)
+    monkeypatch.setattr(pipeline, "think", fake_brain("Half past four."))
+
+    conv = Conversation()
+    sink = FakeSink()
+    spoken = await pipeline.run_turn(
+        None, sink.send_json, sink.send_bytes, conv, text="what time is it"
+    )
+
+    assert calls["stt"] == 0
+    transcript = next(m for m in sink.json if m["type"] == protocol.TRANSCRIPT)
+    assert transcript["text"] == "what time is it"
+
+    # From here on it is an ordinary turn: spoken reply, history, completion frame.
+    assert spoken == 1
+    assert len(sink.bytes) == spoken
+    assert sink.json[-1]["type"] == protocol.TURN_COMPLETE
+    assert conv.messages[0] == {"role": "user", "content": "what time is it"}
+    assert conv.messages[1]["role"] == "assistant"
+
+
+async def test_typed_text_wins_over_audio(fake_io, monkeypatch):
+    """``text`` is authoritative — supplied audio is ignored, not transcribed."""
+    monkeypatch.setattr(pipeline, "think", fake_brain("Sure."))
+
+    sink = FakeSink()
+    await pipeline.run_turn(
+        b"raw-audio", sink.send_json, sink.send_bytes, Conversation(), text="typed"
+    )
+
+    transcript = next(m for m in sink.json if m["type"] == protocol.TRANSCRIPT)
+    assert transcript["text"] == "typed"  # not the fake STT's "hello amber"
+
+
+async def test_typed_text_ignores_stt_flag(fake_io, monkeypatch):
+    """The STT flag governs transcription, not typed input — text still gets through."""
+    monkeypatch.setattr(pipeline, "think", fake_brain("Understood."))
+    monkeypatch.setenv("AMBER_FEATURE_STT", "false")
+    pipeline.get_settings.cache_clear()
+
+    conv = Conversation()
+    sink = FakeSink()
+    try:
+        await pipeline.run_turn(
+            None, sink.send_json, sink.send_bytes, conv, text="still works"
+        )
+        transcript = next(m for m in sink.json if m["type"] == protocol.TRANSCRIPT)
+        # Without the typed path this would be "" and hit the reprompt instead.
+        assert transcript["text"] == "still works"
+        assert conv.messages[0]["content"] == "still works"
+    finally:
+        pipeline.get_settings.cache_clear()

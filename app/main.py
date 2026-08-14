@@ -152,6 +152,23 @@ async def voice_socket(websocket: WebSocket) -> None:
                 pass
         current_turn = None
 
+    async def start_turn(
+        *, audio: bytes | None = None, text: str | None = None
+    ) -> None:
+        """Spawn one turn, spoken or typed. The caller has already admitted it.
+
+        Both input modes share this: barge-in on any in-flight turn, count the turn
+        against the session, then run it off the receive loop so the socket keeps
+        reading (that's what makes interrupt work).
+        """
+        nonlocal current_turn
+        await cancel_current("barge-in")
+        session.turns += 1
+        manager.touch(session)
+        current_turn = asyncio.create_task(
+            _guarded_turn(audio, send_json, send_bytes, session, text=text)
+        )
+
     try:
         while True:
             message = await websocket.receive()
@@ -163,18 +180,14 @@ async def voice_socket(websocket: WebSocket) -> None:
             if data is not None:
                 if not await _admit_utterance(data, session, settings, send_json):
                     continue
-                # New utterance. Barge-in: drop any in-flight turn first.
-                await cancel_current("barge-in")
-                session.turns += 1
-                manager.touch(session)
-                current_turn = asyncio.create_task(
-                    _guarded_turn(data, send_json, send_bytes, session)
-                )
+                await start_turn(audio=data)
                 continue
 
             text = message.get("text")
             if text is not None:
-                await _handle_control(text, cancel_current, session)
+                await _handle_control(
+                    text, cancel_current, start_turn, session, settings, send_json
+                )
 
     except WebSocketDisconnect:
         logger.info("[%s] Client disconnected", session.id)
@@ -192,11 +205,12 @@ async def voice_socket(websocket: WebSocket) -> None:
 async def _admit_utterance(
     data: bytes, session: Session, settings: Settings, send_json
 ) -> bool:
-    """Apply the cost/abuse guardrails to an inbound utterance.
+    """Apply the cost/abuse guardrails to an inbound *spoken* utterance.
 
     Returns ``True`` if the turn may proceed; otherwise sends a coded ``error``
     frame and returns ``False``. Checks run cheapest-first so a rejected utterance
-    spends nothing on STT/LLM/TTS.
+    spends nothing on STT/LLM/TTS. The size check is audio-specific; the rest are
+    shared with typed turns via ``_admit_turn``.
     """
     if settings.max_audio_bytes > 0 and len(data) > settings.max_audio_bytes:
         logger.warning(
@@ -210,6 +224,15 @@ async def _admit_utterance(
         )
         return False
 
+    return await _admit_turn(session, settings, send_json)
+
+
+async def _admit_turn(session: Session, settings: Settings, send_json) -> bool:
+    """The guardrails every turn obeys, however the user produced it.
+
+    A typed turn costs the same LLM/TTS spend as a spoken one, so the session cap
+    and the rate limit apply identically — only the audio size check doesn't.
+    """
     if (
         settings.max_turns_per_session > 0
         and session.turns >= settings.max_turns_per_session
@@ -236,7 +259,14 @@ async def _admit_utterance(
     return True
 
 
-async def _handle_control(text: str, cancel_current, session: Session) -> None:
+async def _handle_control(
+    text: str,
+    cancel_current,
+    start_turn,
+    session: Session,
+    settings: Settings,
+    send_json,
+) -> None:
     """Handle an inbound JSON control frame."""
     try:
         payload = json.loads(text)
@@ -249,6 +279,16 @@ async def _handle_control(text: str, cancel_current, session: Session) -> None:
     kind = payload.get("type")
     if kind == protocol.INTERRUPT:
         await cancel_current("client interrupt")
+    elif kind == protocol.USER_TEXT:
+        # A typed turn: the client already has the words, so STT is skipped. It is
+        # otherwise a peer of a spoken utterance — same guardrails, same barge-in.
+        typed = payload.get("text")
+        if not isinstance(typed, str) or not typed.strip():
+            # Blank/malformed, like any other bad control frame: ignore quietly
+            # rather than spend a turn or an error frame on it.
+            logger.debug("[%s] Ignoring empty user_text frame", session.id)
+        elif await _admit_turn(session, settings, send_json):
+            await start_turn(text=typed.strip())
     elif kind == protocol.REGISTER_TOOLS:
         names = session.client_tools.register(payload.get("tools"))
         logger.info("[%s] Client registered %d tool(s): %s", session.id, len(names), names)
@@ -264,9 +304,17 @@ async def _handle_control(text: str, cancel_current, session: Session) -> None:
 
 
 async def _guarded_turn(
-    audio: bytes, send_json, send_bytes, session: Session
+    audio: bytes | None,
+    send_json,
+    send_bytes,
+    session: Session,
+    *,
+    text: str | None = None,
 ) -> None:
-    """Run one turn, converting failures into an error frame instead of a crash."""
+    """Run one turn, converting failures into an error frame instead of a crash.
+
+    Exactly one of ``audio`` (spoken) or ``text`` (typed) carries the user's input.
+    """
     try:
         await run_turn(
             audio,
@@ -278,6 +326,7 @@ async def _guarded_turn(
             # calls are attributable to a session and a peer call joins the same
             # exchange.
             conversation_id=session.id,
+            text=text,
         )
     except asyncio.CancelledError:
         raise  # interrupt/barge-in — expected, let it unwind

@@ -59,13 +59,14 @@ _DIDNT_CATCH = "Sorry, I didn't catch that. Could you say it again?"
 
 
 async def run_turn(
-    audio: bytes,
+    audio: bytes | None,
     send_json: SendJson,
     send_bytes: SendBytes,
     conversation: Conversation | None = None,
     client_tools: "ClientTools | None" = None,
     *,
     conversation_id: str | None = None,
+    text: str | None = None,
 ) -> int:
     """Process one user turn and stream the spoken reply back.
 
@@ -76,6 +77,11 @@ async def run_turn(
     and tool calls are attributable to it in the usage tables, and so any peer agent
     Amber calls joins the same exchange.
 
+    ``text`` is a typed turn (a ``user_text`` frame): the client already has the
+    words, so they're taken verbatim and ``audio`` is ignored — the only difference
+    is that STT is skipped. Everything from the ``transcript`` frame onward is the
+    same path a spoken turn takes.
+
     Returns the number of sentences spoken. Raises on transport/API failure so the
     caller can emit an error frame; ``asyncio.CancelledError`` from an interrupt is
     allowed to propagate untouched.
@@ -83,12 +89,15 @@ async def run_turn(
     settings = get_settings()
     conversation = conversation if conversation is not None else Conversation()
 
-    # 1. Transcribe (or skip, per feature flag).
-    if settings.feature_stt:
+    # 1. Transcribe — or take the client's typed text verbatim, skipping STT.
+    if text is not None:
+        transcript_text = text
+    elif settings.feature_stt:
         transcript_text = await transcribe(audio)
     else:
         transcript_text = ""
         logger.info("STT disabled (AMBER_FEATURE_STT=false); using canned greeting")
+    # Echoed for typed turns too, so a client renders both input modes identically.
     await send_json(protocol.transcript(transcript_text))
 
     # 2. Think -> stream -> speak.

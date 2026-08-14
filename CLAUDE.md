@@ -175,12 +175,23 @@ performance-critical seam; keep it intact when modifying the pipeline. The pendi
 
 Every client speaks the same protocol — building a new client means writing a thin
 wrapper around it:
-- **Send:** raw audio.
+- **Send:** raw audio, or a `user_text` frame when the client already has the words.
 - **Receive:** streamed audio + optional metadata (transcript, thinking state, tool events).
 - **Interrupt:** client sends an interrupt message → Amber stops speaking mid-response.
 
 Treat this protocol as a stable public contract. Changing message shapes breaks every
 client; additive changes only.
+
+**Typed turns.** `user_text` (`{"type": "user_text", "text": "..."}`) is the exact peer
+of a binary utterance: it takes a turn slot, obeys the same rate limit and session cap,
+and barges in on an in-flight turn identically. The *only* difference is that STT is
+skipped — `run_turn(audio=None, ..., text=...)` takes the words verbatim, and everything
+from the `transcript` echo onward is the same code path a spoken turn takes, reply
+audio included. Guardrails split accordingly: `_admit_utterance` keeps the audio-only
+size check and delegates the shared ones to `_admit_turn`. Blank or non-string text is
+ignored silently, like any other malformed control frame. This exists because a desktop
+client needs typed input to be a usable debugging surface; voice-only clients are
+unaffected.
 
 ### Memory
 
