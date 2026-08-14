@@ -32,7 +32,7 @@ Amber both **calls** and **is called**:
           voice client ──WS──►  /ws   ─► brain ─► agent-runtime ─► OpenRouter
                                               └─► tools ─┬─► inline (app/tools)
                                                          └─► peer MCP servers
-  spawner / Lucidity ──HTTP──►  /mcp  ─► Amber's MCP server (memory, tasks)
+  spawner / Aperture ──HTTP──►  /mcp  ─► Amber's MCP server (memory, tasks)
                                 /agent/usage
 ```
 

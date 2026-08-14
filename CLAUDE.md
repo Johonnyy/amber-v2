@@ -15,7 +15,7 @@ A personal, open-source ecosystem of independent apps (finance, school, project
 tracking, FreeCallMe's dashboard, etc.), each usable completely standalone, that also
 expose themselves to a personal AI layer via MCP. **Amber** is the orchestrating
 voice/text agent that knows Johnny and can query or act across every connected app.
-**Lucidity** is the unifying Electron shell that ties the apps together visually and
+**Aperture** is the unifying Electron shell that ties the apps together visually and
 manages device config/sync. Every app can be cloned and run alone by anyone — the
 agent layer is always an opt-in extension, never a dependency.
 
@@ -40,13 +40,13 @@ the loop logic.
 | Name | What it is |
 |---|---|
 | **Amber** | Personal orchestrating agent — voice pipeline, memory, backend-only, no frontend |
-| **Lucidity** | Electron shell app — unifying UI, device-local config store, import/export/sync |
+| **Aperture** | Electron shell app — unifying UI, device-local config store, import/export/sync |
 | **agent-spawner** | Service wrapping `agent-runtime` — decides model tier, routes tasks, tracks cost centrally |
 | **notification-relay** | Push notification fan-out (Redis pub/sub → APNs → iOS) |
 | **finance-agent, school-agent, outpost, freecallme, etc.** | Individual domain apps, each with their own frontend + MCP server |
 
 Naming style for future apps: single clean nouns, consistent with
-Outpost/ThinkTank/Lucidity (Forge, Sentinel, Herald, Atlas, etc. — see naming
+Outpost/ThinkTank/Aperture (Forge, Sentinel, Herald, Atlas, etc. — see naming
 brainstorm history for the full candidate list, check for collisions before
 assigning).
 
@@ -66,7 +66,7 @@ assigning).
   CI templates, the hosted config sync store.
 - `amber-template` — scaffold repo, pre-wired with `agent-mcp-py`, Docker, CI,
   backups. `npx degit` starting point for every new app.
-- `lucidity` — Electron shell.
+- `Aperture` — Electron shell.
 - Individual app repos (`finance-agent`, `outpost`, etc.) — each standalone, each
   optionally MCP-enabled.
 - `freecallme` — existing Next.js/Vercel/Supabase app, **not rewritten**; gets a small
@@ -81,13 +81,13 @@ assigning).
   it gets an MCP server written in TypeScript (`@modelcontextprotocol/sdk`) as a
   sidecar, not a port to Python. MCP is the interop layer specifically so language
   doesn't have to match everywhere — only the protocol does.
-- **Lucidity** is Electron + React, frontend-only, not itself an MCP server.
+- **Aperture** is Electron + React, frontend-only, not itself an MCP server.
 - **Registry / service discovery** is not a static YAML file — it's a small hosted sync
   store (living alongside `notification-relay` or similar always-on service) that
-  Lucidity edits through a UI and every headless agent (Amber, spawner, apps) reads
-  directly. Lucidity's on-device storage is a cache + what enables import/export and
+  Aperture edits through a UI and every headless agent (Amber, spawner, apps) reads
+  directly. Aperture's on-device storage is a cache + what enables import/export and
   multi-device sync; it is never the only copy, since headless services must work even
-  when Lucidity isn't open.
+  when Aperture isn't open.
 
 ## Conventions every app must follow
 
@@ -120,7 +120,7 @@ assigning).
 - Every tool call is logged (caller, latency, success, conversation_id) via
   `agent_mcp`'s usage logging.
 - Lightweight thumbs up/down feedback, tagged to conversation_id, surfaces through
-  Lucidity once it exists.
+  Aperture once it exists.
 - The model-tier routing table gets refined from real cost/quality data over time, not
   fixed upfront.
 - Small per-app eval sets (10-20 hand-written query → expected-tool-call cases) catch
@@ -437,7 +437,7 @@ All three changes landed, and the voice loop and WS protocol are untouched:
   built directly on `agent-mcp-py`.
 - **FreeCallMe MCP sidecar**: not started — intended as the proof point for the
   "compose external services, don't rewrite the app" pattern.
-- **Lucidity**: not started, deliberately last — needs enough real agent value to be
+- **Aperture**: not started, deliberately last — needs enough real agent value to be
   worth unifying before building the shell.
 
 ## Build order (current)
@@ -452,5 +452,5 @@ All three changes landed, and the voice loop and WS protocol are untouched:
 5. `agent-spawner`
 6. `finance-agent` as first full proof point
 7. FreeCallMe MCP sidecar
-8. Remaining app agents, shared design system, Lucidity — roughly in that order, but
+8. Remaining app agents, shared design system, Aperture — roughly in that order, but
    not strictly blocking each other

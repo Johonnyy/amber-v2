@@ -3,7 +3,7 @@
 Until now Amber only ever reached *out*: she called tools, and later other agents'
 servers. This module is the other direction. It exposes what she knows — the facts
 she has accumulated, her task list, her pending reminders — as MCP resources and
-tools, so `agent-spawner`, Lucidity, or any other agent can ask her things without
+tools, so `agent-spawner`, Aperture, or any other agent can ask her things without
 going through the voice socket.
 
 Built on `agent-mcp-py`, which is precisely the point: bearer auth, the

@@ -23,7 +23,7 @@ dependencies = [
     # apps' servers as a client.
     "agent-runtime[mcp] @ git+https://github.com/Johonnyy/agent-runtime@8bd6ae6",
     # The convention layer for Amber's own MCP server, so other agents and
-    # Lucidity can query her memory, tasks, and reminders.
+    # Aperture can query her memory, tasks, and reminders.
     "agent-mcp-py @ git+https://github.com/Johonnyy/agent-mcp-py@793a449",
 ]
 
