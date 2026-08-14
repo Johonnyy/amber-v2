@@ -1,5 +1,17 @@
 # Deploying Amber to the OVH VPS (systemd)
 
+> **This is the bare-metal path.** The OVH boxes now run Amber as a container behind
+> Caddy, managed by [`amber-infra`](https://github.com/Johonnyy/amber-infra) —
+> `install.sh --app amber` deploys her, `deploy/migrate-amber-db.sh` moves an
+> existing `/opt/amber` onto the volume, and `deploy/update-amber.sh` replaces
+> `update.sh` (including the voice self-update, which becomes a sentinel file
+> watched by a systemd `.path` unit, since a container has no `systemctl`).
+>
+> Everything below still works and is still supported — it is the right way to run
+> Amber on a dev VPS or any box without Docker. The `Dockerfile` at the repo root is
+> the containerised counterpart; its canonical copy lives in `amber-infra/amber/`,
+> so change them together.
+
 ## First-time setup (scripted)
 
 [`setup.sh`](setup.sh) does the whole first-time install and **prompts you** for
