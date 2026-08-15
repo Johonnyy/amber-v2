@@ -168,7 +168,7 @@ feature_llm="$(env_get AMBER_FEATURE_LLM | tr '[:upper:]' '[:lower:]')"
 
 declare -A LABELS=(
   [AMBER_OPENAI_API_KEY]="OpenAI API key (STT + TTS)"
-  [AMBER_ANTHROPIC_API_KEY]="Anthropic API key (the Claude brain)"
+  [AMBER_OPENROUTER_API_KEY]="OpenRouter API key (the LLM brain, via agent-runtime)"
 )
 
 missing_required=0
@@ -194,7 +194,7 @@ for key in $(grep -oE '^AMBER_[A-Z0-9_]+' "$EXAMPLE" | sort -u); do
   if [ -z "$val" ]; then
     case "$key" in
       AMBER_OPENAI_API_KEY) need=1 ;;
-      AMBER_ANTHROPIC_API_KEY) [ "$feature_llm" = "false" ] || need=1 ;;
+      AMBER_OPENROUTER_API_KEY) [ "$feature_llm" = "false" ] || need=1 ;;
     esac
   fi
   [ "$need" -eq 1 ] && prompt_for "$key"

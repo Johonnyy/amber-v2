@@ -50,7 +50,7 @@ It reconciles everything, each step idempotent:
   was rebuilt.
 - **`.env`** — adds any new keys that appeared in `.env.example` (carrying their
   defaults), then **prompts** for any required secret still unset or left as a
-  `...` placeholder (`AMBER_OPENAI_API_KEY`, and `AMBER_ANTHROPIC_API_KEY` unless
+  `...` placeholder (`AMBER_OPENAI_API_KEY`, and `AMBER_OPENROUTER_API_KEY` unless
   `AMBER_FEATURE_LLM=false`). Existing values and optional empties (e.g.
   `AMBER_AUTH_SECRET`) are never touched. If a required secret is missing and
   there's no terminal (cron), it warns and exits non-zero instead of starting a

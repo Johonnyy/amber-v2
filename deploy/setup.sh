@@ -144,6 +144,15 @@ if [ ! -f "$ENV_FILE" ]; then
     OPENAI_KEY="$(ask_secret "OpenAI API key (AMBER_OPENAI_API_KEY, required)")"
     [ -z "$OPENAI_KEY" ] && warn "required — try again"
   done
+  # The brain's key. Required like the OpenAI one: .env.example ships it as the
+  # literal placeholder `sk-or-...`, and a placeholder is not an unset key — it
+  # reaches OpenRouter as a real header and comes back as a bare 401, which reads
+  # like an outage rather than a setup step nobody was asked about.
+  OPENROUTER_KEY=""
+  while [ -z "$OPENROUTER_KEY" ]; do
+    OPENROUTER_KEY="$(ask_secret "OpenRouter API key (AMBER_OPENROUTER_API_KEY, the LLM brain, required)")"
+    [ -z "$OPENROUTER_KEY" ] && warn "required — try again"
+  done
   AUTH_SECRET="$(ask_secret "WS auth secret (AMBER_AUTH_SECRET, blank = no auth)")"
   PORT="$(ask "Server port (AMBER_PORT)" "8000")"
   LOG_LEVEL="$(ask "Log level (DEBUG/INFO/WARNING)" "INFO")"
@@ -160,7 +169,8 @@ if [ ! -f "$ENV_FILE" ]; then
       echo "${key}=${val}" >> "$ENV_FILE"
     fi
   }
-  set_kv AMBER_OPENAI_API_KEY "$OPENAI_KEY"
+  set_kv AMBER_OPENAI_API_KEY     "$OPENAI_KEY"
+  set_kv AMBER_OPENROUTER_API_KEY "$OPENROUTER_KEY"
   set_kv AMBER_AUTH_SECRET    "$AUTH_SECRET"
   set_kv AMBER_PORT           "$PORT"
   set_kv AMBER_LOG_LEVEL      "$LOG_LEVEL"
