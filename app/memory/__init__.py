@@ -13,20 +13,27 @@ This is *not* the per-connection conversation history (`app.session`): that's th
 LLM's short-term context and dies with the socket. Memory outlives every session.
 
 The public surface the pipeline uses is just two coroutines — `remember` (write
-half) and `build_context` (read half) — plus `get_store` for direct access.
+half) and `build_memory_view` (read half) — plus `get_store` for direct access.
 """
 
 from __future__ import annotations
 
-from app.memory.context import build_context, build_memory_view
+from app.memory.context import (
+    MemoryView,
+    build_memory_view,
+    build_notes_block,
+    rank_facts,
+)
 from app.memory.store import MemoryStore, get_store
 from app.memory.writer import extract_facts, remember
 
 __all__ = [
     "MemoryStore",
+    "MemoryView",
     "get_store",
     "remember",
     "extract_facts",
-    "build_context",
     "build_memory_view",
+    "build_notes_block",
+    "rank_facts",
 ]

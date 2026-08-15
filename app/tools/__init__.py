@@ -4,10 +4,14 @@ Fast and local to Amber, each an ordinary Python call — she never makes an HTT
 request to herself to add a task:
 
 * ``web_search`` — a single lookup, not a research engine.
+* ``read_url`` — the full text of one page, usually a search result.
 * the task tools (``add_task`` / ``list_tasks`` / ``complete_task``).
-* ``set_reminder``.
-* ``recall_recent`` — read recent durable conversations on demand; only offered
-  when memory is on.
+* the reminder tools (``set_reminder`` / ``list_reminders`` / ``complete_reminder``).
+* the memory tools (``search_memory`` / ``remember_fact`` / ``correct_fact`` /
+  ``forget_fact``) — how Amber curates what she remembers, as opposed to the
+  automatic writer that captures what was merely said. Only offered when memory is on.
+* ``recall_recent`` — search or replay recent durable conversations on demand; only
+  offered when memory is on.
 * ``update_server`` — run the deploy update script; only offered when configured.
 
 The inline-vs-delegated distinction the design turns on is still live, but the far
@@ -35,7 +39,15 @@ from __future__ import annotations
 from typing import Any
 
 # Importing the submodules is what populates the registry. Order is irrelevant.
-from app.tools import recall, reminders, search, tasks, update  # noqa: F401
+from app.tools import (  # noqa: F401
+    fetch,
+    memory_tools,
+    recall,
+    reminders,
+    search,
+    tasks,
+    update,
+)
 from app.tools.registry import Tool, ToolRegistry, registry
 
 

@@ -12,6 +12,7 @@ import app.pipeline as pipeline
 import app.session as session_module
 from app import protocol
 from app.main import _authorized, app
+from app.memory import MemoryView
 
 
 @pytest.fixture
@@ -28,7 +29,7 @@ def faked_io(monkeypatch):
             yield chunk
 
     async def no_context(query=None, **kw):
-        return None, []
+        return MemoryView()
 
     async def no_remember(user_text, reply, **kw):
         return []
@@ -102,7 +103,7 @@ def test_awaiting_response_reaches_the_wire(fresh_caches, monkeypatch):
         yield "Which one do you mean?"
 
     async def no_context(query=None, **kw):
-        return None, []
+        return MemoryView()
 
     async def no_remember(user_text, reply, **kw):
         return []

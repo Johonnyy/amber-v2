@@ -24,22 +24,50 @@ from app.tools.registry import registry
 @registry.register(
     name="recall_recent",
     description=(
-        "Look up what was said in the user's recent conversations. Use ONLY when "
-        "the user refers back to something from an earlier talk that isn't in the "
-        "current conversation — e.g. 'what did I ask you about earlier', 'that "
-        "thing from yesterday'. Returns the most recent logged messages, oldest "
-        "first."
+        "Look up what was said in earlier conversations with the user. Use ONLY "
+        "when they refer back to something that isn't in the conversation in front "
+        "of you — 'what did I ask you about earlier', 'that thing from yesterday'. "
+        "Pass a topic to search for it; leave it out to replay the most recent "
+        "messages. Returns messages oldest first. For facts about the user rather "
+        "than things that were said, use search_memory instead."
     ),
-    input_schema={"type": "object", "properties": {}},
+    input_schema={
+        "type": "object",
+        "properties": {
+            "query": {
+                "type": "string",
+                "description": (
+                    "Optional. What the user is referring back to, e.g. 'the "
+                    "restaurant' — omit to replay the most recent messages."
+                ),
+            }
+        },
+    },
     available=lambda: get_settings().feature_memory,
+    read_only=True,
 )
-async def recall_recent() -> str:
+async def recall_recent(query: str | None = None) -> str:
+    """Search the durable log, or replay the tail of it when given nothing to find."""
     limit = get_settings().recall_messages
-    messages = await asyncio.to_thread(get_store().recent_messages, limit)
-    if not messages:
-        return "No earlier conversations on record."
+    store = get_store()
+    query = (query or "").strip()
+
+    if query:
+        messages = await asyncio.to_thread(store.search_messages, query, limit)
+        if not messages:
+            return (
+                f"Nothing in earlier conversations mentions '{query}'. Say you "
+                "don't remember it rather than guessing."
+            )
+        header = f"Earlier conversation about '{query}' (oldest to newest):"
+    else:
+        messages = await asyncio.to_thread(store.recent_messages, limit)
+        if not messages:
+            return "No earlier conversations on record."
+        header = "Recent conversation (oldest to newest):"
+
     lines = [
         f"{'You' if m['role'] == 'assistant' else 'They'}: {m['content']}"
         for m in messages
     ]
-    return "Recent conversation (oldest to newest):\n" + "\n".join(lines)
+    return header + "\n" + "\n".join(lines)

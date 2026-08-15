@@ -30,10 +30,10 @@ import logging
 from collections.abc import AsyncIterator, Awaitable, Callable
 from typing import TYPE_CHECKING
 
-from app import protocol
+from app import protocol, signals
 from app.brain import think
 from app.config import get_settings
-from app.memory import build_memory_view, remember
+from app.memory import build_memory_view, build_notes_block, get_store, remember
 from app.persona import compose_system_prompt
 from app.responder import respond
 from app.runtime_context import build_runtime_context
@@ -106,24 +106,46 @@ async def run_turn(
     # Turn-based conversations: did Amber ask something it expects an answer to?
     # The canned/empty path never awaits; the brain path sets this via expect_reply.
     awaiting = False
+    used_fact_ids: list[int] = []
     try:
         if not transcript_text:
             # Nothing heard (silence, or STT disabled) — reprompt without spending
             # an LLM call or feeding the brain an empty user turn.
             spoken = await _speak_stream(_canned(_DIDNT_CATCH), send_json, send_bytes)
         else:
-            spoken, reply, awaiting = await _think_and_speak(
+            spoken, reply, awaiting, used_fact_ids = await _think_and_speak(
                 transcript_text,
                 conversation,
                 send_json,
                 send_bytes,
                 client_tools,
                 conversation_id=conversation_id,
+                # A typed turn reads on a screen; a spoken one is heard. Same words,
+                # different register — see `app.persona`.
+                modality="text" if text is not None else "voice",
             )
     finally:
         await send_json(protocol.thinking(False))
 
     await send_json(protocol.turn_complete(spoken, awaiting_response=awaiting))
+
+    # Telemetry, queued rather than written — nothing here waits on SQLite. A
+    # correction is the strongest signal Amber got something wrong, and the only one
+    # that arrives without the user ever saying so directly.
+    signals.record(
+        signals.KIND_TURN,
+        name="text" if text is not None else "voice",
+        ok=bool(reply),
+        latency_ms=None,
+        detail=f"sentences={spoken} facts={len(used_fact_ids)}",
+        session_id=conversation_id,
+    )
+    if transcript_text and signals.looks_like_a_correction(transcript_text):
+        signals.record(
+            signals.KIND_CORRECTION,
+            detail=transcript_text,
+            session_id=conversation_id,
+        )
 
     # 3. Write half of memory. Runs only after the audio + completion frame are
     # already sent, so a slow extraction can't delay speech. Best-effort: a failure
@@ -135,7 +157,12 @@ async def run_turn(
         and transcript_text
         and reply
     ):
-        await _remember_safe(transcript_text, reply)
+        # Record which facts earned their place first — a cheap local write, before
+        # the fallible model call, so a barge-in mid-extraction loses only the
+        # extraction. This is the sole evidence memory has that a fact was useful,
+        # and it's what drives promotion and decay.
+        await _touch_safe(used_fact_ids)
+        await _remember_safe(transcript_text, reply, conversation_id=conversation_id)
 
     return spoken
 
@@ -148,18 +175,21 @@ async def _think_and_speak(
     client_tools: "ClientTools | None" = None,
     *,
     conversation_id: str | None = None,
-) -> tuple[int, str, bool]:
+    modality: str = "voice",
+) -> tuple[int, str, bool, list[int]]:
     """Record the user turn, stream a reply, and record what was spoken.
 
-    Returns ``(sentences_spoken, reply_text, awaiting_response)``; the caller uses
-    the reply to feed the memory writer and the flag to set ``turn_complete``. The
-    assistant turn is saved in a ``finally`` so an interrupt mid-response still
+    Returns ``(sentences_spoken, reply_text, awaiting_response, used_fact_ids)``; the
+    caller uses the reply to feed the memory writer, the flag to set
+    ``turn_complete``, and the ids to mark those facts as used once the turn lands.
+    The assistant turn is saved in a ``finally`` so an interrupt mid-response still
     persists the partial reply — the next turn's context reflects what the user
     actually heard. ``awaiting_response`` is the brain's turn-based signal (the
     model called ``expect_reply``); the canned ``respond`` fallback never sets it.
     """
     settings = get_settings()
     signals = TurnSignals()
+    used_fact_ids: list[int] = []
     # A cold turn — the first of a fresh or reconnected session, before this user
     # turn is recorded — has no live history yet, so the brain gets a "where you left
     # off" recap from durable memory. Once the session has turns of its own they
@@ -174,15 +204,22 @@ async def _think_and_speak(
         # prompt (the model's copy) and out to the client as a ``memory`` frame (the
         # user-visible copy), so the two can't drift. The frame is advisory; emitting
         # it before the reply streams lets a client show what Amber is drawing on.
-        memory_block, memory_items = await build_memory_view(
-            transcript_text, include_recap=cold_start
-        )
-        if memory_items:
-            await send_json(protocol.memory(memory_items))
+        view = await build_memory_view(transcript_text, include_recap=cold_start)
+        used_fact_ids = view.fact_ids
+        if view.items:
+            await send_json(protocol.memory(view.items, view.facts))
         # Ambient context (date/time) is rebuilt every turn and always injected,
         # independent of the memory flag — Amber should always know when it is.
         runtime_context = build_runtime_context()
-        system = compose_system_prompt(memory_block, runtime_context)
+        system = compose_system_prompt(
+            runtime_context=runtime_context,
+            memory_block=view.block,
+            modality=modality,
+            client_tool_names=client_tools.names() if client_tools else (),
+            # What the maintenance pass has noticed about how conversations go.
+            # None unless AMBER_FEATURE_SELF_NOTES is on.
+            notes_block=await build_notes_block(),
+        )
         tokens = think(
             conversation.messages,
             system=system,
@@ -203,21 +240,35 @@ async def _think_and_speak(
         reply = "".join(spoken_text).strip()
         if reply:
             conversation.add_assistant(reply)
-    return spoken, reply, signals.awaiting_response
+    return spoken, reply, signals.awaiting_response, used_fact_ids
 
 
-async def _remember_safe(user_text: str, reply: str) -> None:
+async def _remember_safe(
+    user_text: str, reply: str, *, conversation_id: str | None = None
+) -> None:
     """Run the memory writer, swallowing failures so a turn never breaks on it.
 
     A genuine interrupt/barge-in (``CancelledError``) is re-raised so the turn
     unwinds normally; any other error is logged and dropped — memory is best-effort.
     """
     try:
-        await remember(user_text, reply)
+        await remember(user_text, reply, conversation_id=conversation_id)
     except asyncio.CancelledError:
         raise
     except Exception:  # noqa: BLE001 — memory must never take down a turn
         logger.exception("Memory write failed (non-fatal)")
+
+
+async def _touch_safe(fact_ids: list[int]) -> None:
+    """Mark the facts this turn drew on as used. Never fatal, like every memory write."""
+    if not fact_ids:
+        return
+    try:
+        await asyncio.to_thread(get_store().touch_facts, fact_ids)
+    except asyncio.CancelledError:
+        raise
+    except Exception:  # noqa: BLE001 — memory must never take down a turn
+        logger.exception("Memory touch failed (non-fatal)")
 
 
 async def _capture(

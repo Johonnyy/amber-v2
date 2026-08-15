@@ -97,30 +97,91 @@ class Settings(BaseSettings):
     # so it can be larger than the always-on recap above.
     recall_messages: int = 12
 
+    # --- Memory retrieval & lifecycle ---
+    # Character budget for the memory block in the system prompt. The facts cap
+    # above counts rows; this one counts what they actually cost, since twelve long
+    # facts are far more expensive than twelve short ones and every turn pays it.
+    memory_max_chars: int = 1200
+    # How many candidate facts the ranker pulls from the index before scoring. Kept
+    # well above memory_max_facts so scoring has something to choose between, and
+    # well below the table size so the read never degrades into a full scan.
+    memory_candidates: int = 40
+    # Most-used durable facts always included regardless of relevance to this turn.
+    # Identity-level knowledge (who he is, where he lives, how he likes answers)
+    # rarely shares words with the question, so pure relevance ranking drops it.
+    memory_always_durable: int = 5
+    # Cap on open tasks surfaced in the memory block.
+    memory_max_tasks: int = 8
+    # Fact lifecycle, applied by the maintenance pass (app/maintenance.py):
+    # a short-tier fact used fewer than twice and untouched for this long is
+    # forgotten; a session-tier one goes much sooner; durable facts never decay.
+    fact_short_ttl_days: float = 30.0
+    fact_session_ttl_hours: float = 12.0
+    # Uses at which a short-tier fact is promoted to durable. Being repeatedly
+    # useful is the only evidence of durability that doesn't need a model.
+    fact_promote_uses: int = 3
+    # Retention for the raw exchange log. It is the substrate for recall and
+    # re-distillation, not a permanent archive.
+    conversation_keep_days: float = 180.0
+
+    # --- Maintenance (the self-improvement loop) ---
+    # How long after startup the first pass runs. Not cosmetic: the test suite spins
+    # the app up repeatedly, and without a delay every one of those would kick off a
+    # maintenance pass against the real amber.db.
+    maintenance_startup_delay_s: float = 300.0
+    maintenance_interval_s: float = 21600.0  # 6 hours
+    # The model that consolidates facts and writes reflections. Off the latency
+    # path, so it could be a stronger tier than the brain.
+    maintenance_tier: str = "balanced"
+    maintenance_max_tokens: int = 1024
+    # Facts handed to one consolidation call. Bounds both cost and blast radius —
+    # the pass looks at what changed since last time, never the whole store.
+    maintenance_max_facts: int = 60
+    # Hard cap on mutations applied from one model response. A confused model
+    # should be able to make a mess of at most this many facts.
+    maintenance_max_changes: int = 20
+    # Reflections written per pass, and how many are kept in view afterwards.
+    maintenance_max_reflections: int = 3
+    # Retention for telemetry rows.
+    signals_keep_days: float = 30.0
+
     # --- Tools (Phase 4) ---
     # Max tool-use round trips the brain will make in one turn before it must
     # answer with what it has. A backstop against a model that loops on tools.
     max_tool_iterations: int = 5
     # Web search. The provider selects the backend:
-    #   "duckduckgo" — keyless Instant Answer API Amber calls itself (default).
-    #                  Returns only canned "instant answers" (no real web crawl), so
-    #                  it misses most current-events queries — but it needs no key.
-    #   "tavily"     — LLM-oriented search API Amber calls itself; needs
-    #                  search_api_key. The better answer when a key is available.
+    #   "auto"       — tavily when search_api_key is set, duckduckgo when it isn't
+    #                  (default): the good backend when available, a working one
+    #                  otherwise, no configuration required either way.
+    #   "tavily"     — LLM-oriented search API; needs search_api_key. Asking for it
+    #                  explicitly without a key is an error, not a silent downgrade.
+    #   "duckduckgo" — keyless. Instant Answers alone answers almost nothing, so it
+    #                  falls back to scraping the HTML results page — best-effort,
+    #                  and it will break when their markup changes.
     #
     # There used to be a third, "anthropic": a *native server-side* tool Anthropic
     # ran inside the LLM request, which was the default and was far better for
     # current events. It went when the brain moved to `agent_runtime` — a server
     # tool lives inside the provider's own request loop, and the OpenAI-compatible
-    # endpoint has no equivalent. Both remaining providers are ordinary inline tools
-    # Amber dispatches herself. Set `search_api_key` and pick "tavily" to get
-    # comparable quality back.
-    search_provider: str = "duckduckgo"
+    # endpoint has no equivalent. Tavily is the closest replacement, which is why
+    # "auto" prefers it: set AMBER_SEARCH_API_KEY to get comparable quality back.
+    search_provider: str = "auto"
     search_api_key: str = ""
-    # Self-dispatched providers (tavily/duckduckgo): hard cap on result snippets
-    # folded into one tool result (kept small — the model pays for them in tokens).
-    search_max_results: int = 3
+    # Hard cap on result snippets folded into one tool result. Raised from 3 now
+    # that results carry URLs and a snippet is a lead for read_url, not just an
+    # answer — but still small, since the model pays for them in tokens.
+    search_max_results: int = 5
     search_timeout_s: float = 10.0
+    # ``read_url``: fetch one page and hand the model its readable text.
+    read_url_timeout_s: float = 15.0
+    # Hard cap on the download, enforced while streaming rather than by trusting
+    # Content-Length — a missing or lying header must not pull an unbounded body
+    # into memory.
+    read_url_max_bytes: int = 2 * 1024 * 1024  # 2 MB
+    # Characters of extracted text handed to the model. A long article costs real
+    # tokens on every later turn of the exchange; the head of it is nearly always
+    # where the answer is.
+    read_url_max_chars: int = 4000
     # Peer MCP servers Amber may call as a client, as "name=https://host" pairs.
     # Heavy or delegated work goes here now that the OpenClaw bridge is gone — the
     # inline-vs-delegated distinction survives, only the far end changed. Empty
@@ -169,6 +230,19 @@ class Settings(BaseSettings):
     # When false, Amber's own MCP server is not mounted. She stays a *caller* of
     # other agents either way; this only controls whether she is queryable herself.
     feature_mcp_server: bool = True
+    # Telemetry: tool outcomes, corrections, barge-ins, per-turn shape. This is the
+    # raw material the maintenance pass reflects on — with it off, memory hygiene
+    # still runs but Amber notices nothing about how conversations are going.
+    feature_signals: bool = True
+    # The periodic self-maintenance pass (app/maintenance.py): decay, promotion,
+    # consolidation, pruning, self-review. Off means memory never curates itself.
+    feature_maintenance: bool = True
+    # When true, the notes the maintenance pass writes about itself are injected
+    # into every system prompt. Default off: reflections are worth *reading* long
+    # before they're worth acting on automatically, and this is the line between
+    # "Amber notices patterns" and "Amber edits her own instructions". Turn it on
+    # once a few real reflections have been read and judged sane.
+    feature_self_notes: bool = False
 
     # --- Amber's own MCP server ---
     # Comma-separated bearer tokens other agents present to query Amber, each

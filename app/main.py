@@ -31,7 +31,7 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, status
 
-from app import protocol
+from app import protocol, signals
 from app.config import Settings, get_settings
 from app.pipeline import run_turn
 from app.session import Session, SessionManager, get_session_manager
@@ -46,25 +46,47 @@ logger = logging.getLogger("amber")
 
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
-    """Run Amber's own MCP server alongside the voice socket.
+    """Start the background work that runs alongside the voice socket.
 
-    A mounted sub-app's lifespan never runs, so the host has to enter the MCP
-    session manager itself or the very first MCP request fails. `agent_mcp` wraps
-    that (plus sync-store registration and its heartbeat) in one context manager.
+    Three things, all optional and all independent of the voice loop:
 
-    Nothing here is required for the voice loop: when the MCP server is disabled or
-    unconfigured this is an empty context, and `/ws` behaves exactly as before.
+    * the **signal writer**, which batches telemetry to SQLite off the turn path;
+    * the **maintenance loop**, which curates memory and writes self-review notes;
+    * **Amber's own MCP server** — a mounted sub-app's lifespan never runs, so the
+      host has to enter the session manager itself or the first MCP request fails.
+      `agent_mcp` wraps that (plus sync-store registration and its heartbeat).
+
+    With everything disabled this is an empty context and `/ws` behaves exactly as
+    before.
     """
-    if not get_settings().mcp_server_enabled:
-        logger.info("MCP server disabled (no AMBER_MCP_KEYS); serving voice only")
-        yield
-        return
+    settings = get_settings()
+    background: list[asyncio.Task] = []
 
-    from app.mcp_server import get_mcp_server
+    if settings.feature_signals:
+        from app import signals
 
-    async with get_mcp_server().lifespan():
-        logger.info("MCP server mounted at /mcp")
-        yield
+        background.append(asyncio.create_task(signals.drain_loop()))
+    if settings.feature_memory and settings.feature_maintenance:
+        from app.maintenance import maintenance_loop
+
+        background.append(asyncio.create_task(maintenance_loop(settings)))
+
+    try:
+        if not settings.mcp_server_enabled:
+            logger.info("MCP server disabled (no AMBER_MCP_KEYS); serving voice only")
+            yield
+        else:
+            from app.mcp_server import get_mcp_server
+
+            async with get_mcp_server().lifespan():
+                logger.info("MCP server mounted at /mcp")
+                yield
+    finally:
+        for task in background:
+            task.cancel()
+        for task in background:
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await task
 
 
 app = FastAPI(title="Amber", version="0.1.0", lifespan=lifespan)
@@ -145,6 +167,11 @@ async def voice_socket(websocket: WebSocket) -> None:
         nonlocal current_turn
         if current_turn and not current_turn.done():
             logger.info("[%s] Interrupting current turn (%s)", session.id, reason)
+            # An interrupted reply usually means it was too long, or wrong. Worth
+            # noticing over time, so the maintenance pass can say so.
+            signals.record(
+                signals.KIND_BARGE_IN, name=reason, session_id=session.id
+            )
             current_turn.cancel()
             try:
                 await current_turn

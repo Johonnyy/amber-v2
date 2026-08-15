@@ -135,14 +135,25 @@ def turn_complete(sentences: int, awaiting_response: bool = False) -> dict[str, 
     return frame
 
 
-def memory(items: list[str]) -> dict[str, Any]:
+def memory(
+    items: list[str], facts: list[dict[str, Any]] | None = None
+) -> dict[str, Any]:
     """The facts Amber is drawing on this turn, surfaced for the client to display.
 
     Advisory only: a client renders ``items`` (e.g. a memory panel) but the frame
     never affects the voice loop, so clients that ignore it are unaffected. ``items``
     is the same ranked set of distilled facts injected into the LLM's system prompt.
+
+    ``facts`` is the same set again as ``{"id", "content", "tier"}`` records, and is
+    attached only when supplied — ``items`` keeps its exact shape either way, so an
+    existing client is untouched. The ids let a memory panel reference a specific
+    fact (to show it, or to offer to correct it); the tier says whether Amber
+    considers it settled knowledge or something still proving itself.
     """
-    return {"type": MEMORY, "items": list(items)}
+    frame: dict[str, Any] = {"type": MEMORY, "items": list(items)}
+    if facts:
+        frame["facts"] = [dict(f) for f in facts]
+    return frame
 
 
 def tool_call(call_id: str, name: str, tool_input: dict[str, Any]) -> dict[str, Any]:

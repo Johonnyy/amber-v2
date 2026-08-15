@@ -9,6 +9,7 @@ import pytest
 
 import app.pipeline as pipeline
 from app.session import Conversation
+from app.memory import MemoryView
 
 
 class FakeSink:
@@ -40,8 +41,13 @@ async def test_memory_block_reaches_the_brain_system_prompt(fake_io, monkeypatch
 
     async def fake_build_memory_view(query=None, **kw):
         seen["query"] = query
-        block = "What you remember about your user:\n- Has a dog named Mango"
-        return block, ["Has a dog named Mango"]
+        block = "What you remember about your user:\n- [#7] Has a dog named Mango"
+        return MemoryView(
+            block=block,
+            items=["Has a dog named Mango"],
+            facts=[{"id": 7, "content": "Has a dog named Mango", "tier": "durable"}],
+            fact_ids=[7],
+        )
 
     async def fake_think(messages, system=None, **kw):
         seen["system"] = system
@@ -62,16 +68,22 @@ async def test_memory_block_reaches_the_brain_system_prompt(fake_io, monkeypatch
     # The memory block was appended to the persona prompt handed to the brain.
     assert "Has a dog named Mango" in seen["system"]
     assert "You are Amber" in seen["system"]  # persona still present
-    # And the same facts were surfaced to the client as a memory frame.
+    # And the same facts were surfaced to the client as a memory frame. `items`
+    # keeps its exact shape (a stable contract); `facts` is the additive half that
+    # carries ids and tier for a client that wants them.
     mem = [m for m in sink.json if m["type"] == "memory"]
-    assert mem == [{"type": "memory", "items": ["Has a dog named Mango"]}]
+    assert len(mem) == 1
+    assert mem[0]["items"] == ["Has a dog named Mango"]
+    assert mem[0]["facts"] == [
+        {"id": 7, "content": "Has a dog named Mango", "tier": "durable"}
+    ]
 
 
 async def test_runtime_context_reaches_the_brain_system_prompt(fake_io, monkeypatch):
     seen = {}
 
     async def no_view(query=None, **kw):
-        return None, []
+        return MemoryView()
 
     async def fake_think(messages, system=None, **kw):
         seen["system"] = system
@@ -97,7 +109,7 @@ async def test_recap_requested_only_on_a_cold_session_start(fake_io, monkeypatch
 
     async def spy_view(query=None, *, include_recap=False, **kw):
         recaps.append(include_recap)
-        return None, []
+        return MemoryView()
 
     async def fake_think(messages, system=None, **kw):
         yield "Okay."
@@ -122,7 +134,7 @@ async def test_writer_called_with_exchange_after_turn(fake_io, monkeypatch):
     calls = []
 
     async def no_context(query=None, **kw):
-        return None, []
+        return MemoryView()
 
     async def fake_think(messages, system=None, **kw):
         yield "Nice, Mango sounds lovely."
@@ -143,7 +155,7 @@ async def test_writer_called_with_exchange_after_turn(fake_io, monkeypatch):
 
 async def test_writer_failure_does_not_break_the_turn(fake_io, monkeypatch):
     async def no_context(query=None, **kw):
-        return None, []
+        return MemoryView()
 
     async def fake_think(messages, system=None, **kw):
         yield "All good."

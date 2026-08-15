@@ -7,6 +7,7 @@ import pytest
 import app.pipeline as pipeline
 from app import protocol
 from app.session import Conversation
+from app.memory import MemoryView
 
 
 class FakeSink:
@@ -34,7 +35,7 @@ def fake_io(monkeypatch):
         return f"AUDIO[{text}]".encode()
 
     async def no_context(query=None, **kw):
-        return None, []
+        return MemoryView()
 
     async def no_remember(user_text, reply, **kw):
         return []

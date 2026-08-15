@@ -259,62 +259,123 @@ Key modules: [app/config.py](app/config.py) (all tiers/keys/flags),
 [app/protocol.py](app/protocol.py) (WS wire contract),
 [app/sentence_splitter.py](app/sentence_splitter.py) (streaming seam),
 [app/pipeline.py](app/pipeline.py) (the voice loop), [app/main.py](app/main.py)
-(FastAPI + `/ws` + `/mcp` + `/agent/usage`). The "brain" is
+(FastAPI + `/ws` + `/mcp` + `/agent/usage`, and the lifespan that starts the signal
+writer and the maintenance loop). The "brain" is
 [app/brain.py](app/brain.py) — a thin wrapper over `agent_runtime.AgentRunner` —
 with its personality in [app/persona.py](app/persona.py) (`compose_system_prompt`
-layers the per-turn context blocks onto the persona: the runtime context first,
-then the memory block); [app/session.py](app/session.py) holds per-connection
+composes the core, the modality block, the device block, and the per-turn context);
+[app/signals.py](app/signals.py) and [app/maintenance.py](app/maintenance.py) are
+the self-improvement loop; [app/session.py](app/session.py) holds per-connection
 conversation history. [app/responder.py](app/responder.py) is the canned fallback
 used when `AMBER_FEATURE_LLM=false`. Both speak the same `AsyncIterator[str]`
 contract, so the pipeline downstream of the brain is unchanged.
 
-Per-turn context. Every system prompt is the static persona plus two fresh blocks
-the pipeline builds each turn, so the brain always knows "when it is" and "what it
-knows": `app/runtime_context.py` (`build_runtime_context`) is a one-line date/time
-stamp read in `AMBER_TIMEZONE` (unknown zone → UTC) — *always* injected, independent
-of the memory flag; and the memory block below. The conversation history downstream
-supplies "what was just said".
+The system prompt is **composed, not monolithic** ([app/persona.py](app/persona.py)).
+`compose_system_prompt` is keyword-only and layers a fixed `CORE` (identity, how to
+answer, tools, memory posture) with blocks that only apply to this turn: a
+**modality** block (`SPOKEN_STYLE` for audio turns, `TYPED_STYLE` for `user_text`
+ones — the pipeline derives it from `text is not None`), a **device** block naming
+the client tools this connection actually declared, and the per-turn context blocks.
+That structure exists because one flat prompt drifted badly: it named a deleted
+backend three times, banned emoji then required one, described display tools a
+headless client never had, and gave "spell it for the ear" rules to typed replies.
+A block that's only emitted when it applies can't rot the same way. `SYSTEM_PROMPT`
+is `compose_system_prompt()` with no context — the brain's default.
 
-Persistent memory (Phase 3) lives in the `app/memory/` package: `store.py` (SQLite
-`facts`/`conversations`/`tasks`/`reminders` tables + sync CRUD, `get_store()`),
-`writer.py` (`remember` — distil facts from an exchange via a cheap LLM call through
-`agent_runtime`, after the turn is spoken), and `context.py` (`build_memory_view` —
-rank relevant facts in one store pass into both a compressed prompt *block* for the
-system prompt and a flat list of *items* for client display; `build_context` is the
-block-only wrapper). On a *cold* turn (the first of a fresh/reconnected session,
-empty live history) the pipeline passes `include_recap=True` so `build_memory_view`
-appends a short "where you left off" replay of the last
-`AMBER_RECENT_RECAP_MESSAGES` durable messages — cross-session continuity the live
-history can't give yet; warm turns skip it (history already carries recent context)
-and the recap is prompt-only (never in `items`). Gated by `AMBER_FEATURE_MEMORY`;
-the read half runs inline before the brain — injecting the block into the prompt
-*and* emitting an additive `memory` protocol frame (the same facts, advisory, for
-the client's memory panel) — and the write half runs off the latency path after
-`turn_complete`. Memory is *persistent cross-session knowledge*, distinct from the
-in-memory per-connection history in `app/session.py` — don't conflate them.
+Per-turn context. `app/runtime_context.py` (`build_runtime_context`) is a one-line
+date/time stamp read in `AMBER_TIMEZONE` (unknown zone → UTC), *always* injected
+independent of the memory flag; then the memory block. The conversation history
+downstream supplies "what was just said". The core prompt tells Amber her training
+data has a cutoff and to search rather than guess about anything current — the
+direct fix for confidently out-of-date answers.
 
-Tools (Phase 4) live in the `app/tools/` package, gated by `AMBER_FEATURE_TOOLS`.
-`registry.py` is the pattern: `@registry.register(name, description, input_schema)`
-decorates a Python function (sync or async) returning a result string; `schemas()`
-exports the tool list and `dispatch()` runs a call, converting any error into a
-string so a bad tool never crashes a turn. A tool may carry an `available()`
-predicate — unavailable tools are hidden and refuse to run. Inline tools:
-`search.py`, `tasks.py` (`add_task`/`list_tasks`/`complete_task` over the store),
-`reminders.py` (`set_reminder` — persists to the `reminders` table; firing/delivery
-is future work), `recall.py` (`recall_recent`, gated by `feature_memory`) and
-`update.py` (`update_server`, only offered when `AMBER_UPDATE_COMMAND` is set).
-Heavier or delegated work goes to a **peer MCP server** listed in
-`AMBER_MCP_PEERS`; the OpenClaw HTTP bridge that used to fill that role is gone.
+Persistent memory lives in the `app/memory/` package.
 
-Web search is self-dispatched only, by `AMBER_SEARCH_PROVIDER`
-([app/tools/search.py](app/tools/search.py)): `duckduckgo` (keyless default, canned
-Instant Answers, misses most current events) or `tavily` (keyed, much better). There
-*was* a third — `anthropic`, a **native server-side** tool the model ran inside its
-own request, which was the default and handled live queries far better. It went with
-the brain swap: a server tool only exists inside a provider's own request loop, and
-the OpenAI-compatible endpoint has no equivalent. `pause_turn` handling went with
-it, since it existed only to resume a server tool. **If current-events quality
-matters, set `AMBER_SEARCH_API_KEY` and select `tavily`.**
+* `store.py` — SQLite, with a real **migration runner** (`amber_schema_version` +
+  an ordered `_MIGRATIONS` tuple). A table rather than `PRAGMA user_version`
+  because `amber.db` is shared three ways (memory, `agent_mcp`'s usage log,
+  `agent_runtime`'s cost rows) and that pragma is a single file-wide slot. The
+  store also sets `journal_mode=WAL` and a busy timeout, which is the co-tenancy
+  contract `agent_mcp` documents and this store used to be the one tenant ignoring.
+* **Facts are tiered.** Every fact carries `tier` (`session`/`short`/`durable`),
+  `confidence`, `status` (`active`/`superseded`/`forgotten`), `use_count`,
+  `last_used_at`, `superseded_by` and `source`. That's what lets memory curate
+  itself: repeated usefulness promotes, disuse decays, a correction supersedes
+  rather than accumulating a contradicting twin. `add_fact` **reinforces** an
+  existing fact instead of dropping a duplicate — repeat mention is signal. Facts
+  are searched through FTS5 (capability-detected at open; `LIKE` fallback for a
+  SQLite build without it). Deletion is soft throughout, so a bad correction is
+  recoverable.
+* `context.py` — `build_memory_view` returns a `MemoryView` (`block`, `items`,
+  `facts`, `fact_ids`) from one bounded read: an index search for this utterance,
+  unioned with the most-used durable facts *regardless of relevance* (identity-level
+  knowledge rarely shares words with the question, so pure relevance ranking drops
+  exactly what matters most). Scoring blends relevance, tier, confidence, use count
+  and recency; the block is capped by count **and** characters. It used to read every
+  fact and tokenize all of them in Python on the latency path.
+* `writer.py` — `remember` distils facts after the turn is spoken. Two fixes worth
+  knowing: the "already known" list is now **searched, not sampled** (it was the 12
+  newest, so the extractor went blind as the store grew), and the exchange is
+  **logged before extraction**, so a failure or a barge-in no longer loses the raw
+  record too.
+
+The read half runs inline before the brain — injecting the block *and* emitting the
+additive `memory` frame (now optionally carrying `{id, content, tier}` alongside the
+unchanged `items`). The write half runs after `turn_complete`, and touches the facts
+the turn used *before* the model call, so a barge-in loses only the extraction.
+Memory is *persistent cross-session knowledge*, distinct from the in-memory
+per-connection history in `app/session.py` — don't conflate them.
+
+Tools live in the `app/tools/` package, gated by `AMBER_FEATURE_TOOLS`.
+`registry.py` is the pattern: `@registry.register(name, description, input_schema,
+available=..., read_only=...)` decorates a Python function (sync or async) returning
+a result string; `schemas()` exports the tool list and `dispatch()` runs a call,
+converting any error into a string so a bad tool never crashes a turn. Results and
+error strings are **clamped** there, so one runaway page of output or an httpx
+traceback repr can't poison the rest of the exchange. `dispatch` is also where every
+tool call is timed and recorded (see signals below) — one choke point, so nothing
+has to instrument itself. Query tools carry `read_only=True`, surfaced as
+`x_agent.read_only`, the ecosystem convention.
+
+Inline tools: `search.py` (`web_search`), `fetch.py` (`read_url`), `tasks.py`,
+`reminders.py` (`set_reminder`), `memory_tools.py` (`search_memory`,
+`remember_fact`, `correct_fact`, `forget_fact`, `list_reminders`,
+`complete_reminder` — gated by `feature_memory`), `recall.py` (`recall_recent`, now
+searchable) and `update.py` (`update_server`, only when `AMBER_UPDATE_COMMAND` is
+set). Heavier or delegated work goes to a **peer MCP server** listed in
+`AMBER_MCP_PEERS`.
+
+**Amber curates her own memory.** The memory tools exist because memory used to
+happen *to* her: she could not search, commit, correct or forget a fact, so "no, I
+moved to Denver" left the wrong fact in every future prompt — and a peer agent over
+MCP could search her facts when she couldn't. The split with the automatic writer is
+by *intent*: the writer captures what was merely **said** (provisional, `short`,
+earning permanence by proving useful); the tools capture what was **meant** — an
+explicit "remember this", or a correction — landing `durable` with high confidence
+and `source='explicit'`. The tool descriptions lean hard on that, because the failure
+mode is Amber calling `remember_fact` every turn and duplicating the writer.
+
+Web search ([app/tools/search.py](app/tools/search.py)) resolves
+`AMBER_SEARCH_PROVIDER`: `auto` (**default**) picks `tavily` when
+`AMBER_SEARCH_API_KEY` is set and `duckduckgo` when it isn't; an explicit `tavily`
+without a key is a config error rather than a silent downgrade. DuckDuckGo falls
+back to scraping the HTML results page, because Instant Answers alone answers almost
+nothing — best-effort, and it will break when their markup changes. Results are
+formatted answer-first with **sourced snippets and their URLs**, which is what makes
+`read_url` usable as a second hop. There *was* a third provider — `anthropic`, a
+**native server-side** tool the model ran inside its own request, which handled live
+queries far better. It went with the brain swap: a server tool only exists inside a
+provider's own request loop. **Tavily is the closest replacement, so setting
+`AMBER_SEARCH_API_KEY` is the single biggest quality win available.**
+
+`read_url` ([app/tools/fetch.py](app/tools/fetch.py)) fetches one page and hands back
+its readable text, extracted by a stdlib `html.parser` subclass
+([app/tools/htmltext.py](app/tools/htmltext.py)) — no new dependency; `trafilatura`
+is the upgrade if quality demands it. **It is the one genuinely new attack surface
+in Amber**: she runs on a VPS beside other services, so `_check_url` refuses
+non-HTTP schemes and any host resolving into a loopback/private/link-local/reserved
+range, *before* an HTTP client is constructed. The residual DNS-rebinding gap is
+documented rather than papered over.
 
 **The agentic loop is no longer Amber's code.** `agent_runtime.AgentRunner` owns
 stream → tool call → execute → feed back → repeat; `app/brain.py` composes the
@@ -349,12 +410,34 @@ the brain offers them prefixed `client_` and dispatches calls back over the WS. 
 reach the model through the same `AnthropicRegistryBroker` adapter, because
 `ClientTools` already exposes the schema/dispatch pair it wants.
 
-[app/mcp_server.py](app/mcp_server.py) is the other direction: Amber's own MCP
-server on `agent-mcp-py`, mounted at `/mcp` with `/agent/usage` beside it, exposing
-`amber://memory/facts`, `amber://tasks/open`, `amber://reminders/pending` and
-`amber://memory/conversations` as resources, plus `search_memory` / `list_tasks` /
-`add_task` / `complete_task` as tools — dispatched through the same registry, never
-a parallel implementation.
+**Getting better unattended.** Two pieces, both off the latency path.
+
+`app/signals.py` records what actually happens: tool outcomes with latency (from
+`registry.dispatch`), barge-ins (`main.cancel_current`), user corrections (a
+deliberately conservative regex — a false positive costs one junk row, and
+over-matching would teach the pass that Amber is wrong constantly), and per-turn
+shape. Writes go through a **bounded queue drained by one background task**, and a
+full queue drops the oldest row rather than applying backpressure: losing telemetry
+is always better than delaying speech. Gated by `AMBER_FEATURE_SIGNALS`.
+
+`app/maintenance.py` runs periodically (started in the lifespan, or by hand with
+`python -m app.maintenance`) and curates memory in five steps — **deterministic
+first, so a model outage never costs the cheap wins**: decay stale unused low-tier
+facts (durable facts never decay), promote short-tier facts that keep proving
+useful, consolidate duplicates and contradictions via one bounded LLM call, prune the
+exchange log and old telemetry, then write 1–3 short self-review notes from the
+telemetry. Every step is individually failure-isolated, idempotent, and bounded —
+facts per pass, changes per pass, reflections per pass. Consolidation can only touch
+ids it was actually shown, and never drops an `explicit` fact in favour of an
+extracted one.
+
+Where the improvement comes from: facts stop duplicating and contradicting, noise
+ages out, and useful facts get promoted and start winning retrieval — a compounding
+gain in every prompt, with **no prompt mutation at all**. Reflections are *readable*
+by default (`amber://memory/reflections`), not injected. Injecting them is
+`AMBER_FEATURE_SELF_NOTES`, **off by default** — that flag is the deliberate line
+between "Amber notices patterns" and "Amber edits her own instructions". The persona
+in git is never rewritten by the model either way.
 
 The agentic loop — stream → tool call → execute → feed results back → repeat — is no
 longer Amber's code. `agent_runtime.AgentRunner` owns it, reached through
@@ -363,10 +446,13 @@ longer Amber's code. `agent_runtime.AgentRunner` owns it, reached through
 so only spoken text is recorded.
 
 [app/mcp_server.py](app/mcp_server.py) is the other direction: Amber's own MCP server
-on `agent-mcp-py`, exposing `amber://memory/facts`, `amber://tasks/open`,
-`amber://reminders/pending` and `amber://memory/conversations` as resources, plus
+on `agent-mcp-py`, mounted at `/mcp` with `/agent/usage` beside it, exposing
+`amber://memory/facts`, `amber://tasks/open`, `amber://reminders/pending`,
+`amber://memory/conversations` and `amber://memory/reflections` as resources, plus
 `search_memory` / `list_tasks` / `add_task` / `complete_task` as tools — dispatched
-through the same registry, never a parallel implementation.
+through the same registry, never a parallel implementation. (`search_memory` was the
+last parallel implementation: a private substring scan that could drift from what
+Amber herself sees. It now dispatches like the rest.)
 
 Reliability is concentrated in the transport layer. [app/session.py](app/session.py)
 holds, besides `Conversation` (the per-turn history, capped by `max_history_turns`), a
@@ -428,9 +514,17 @@ All three changes landed, and the voice loop and WS protocol are untouched:
 
 ## Current state (update this section as things change)
 
-- **Amber**: all 5 phases plus the ecosystem refactor above. Voice pipeline complete,
-  streaming seam intact, 133 tests in `tests/`. Runs on `agent-runtime` and serves
-  her own MCP server.
+- **Amber**: all 5 phases, the ecosystem refactor above, and the memory/prompt
+  overhaul (tiered self-curating memory with migrations and FTS retrieval, a
+  composed modality-aware prompt, memory-management tools, `auto` search +
+  `read_url`, telemetry, and the unattended maintenance pass). Voice pipeline
+  complete, streaming seam intact, 353 tests in `tests/`. Runs on `agent-runtime`
+  and serves her own MCP server.
+  - **Not yet done here:** reminders still can't *fire* — they're recorded,
+    listable and completable, but delivery needs a server-initiated protocol frame.
+    The maintenance scheduler makes that a small follow-on. Long-term memory as
+    markdown files is a future phase; the fact tiering is its on-ramp
+    (`durable` + `category` + provenance export cleanly to one file per fact).
 - **agent-mcp-py**: **built.** The convention layer — auth, depth guard, usage log,
   sync registration. 180 tests, verified end to end against a live server.
 - **agent-runtime**: **built.** The shared agentic loop on OpenRouter's

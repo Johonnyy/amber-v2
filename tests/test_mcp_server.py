@@ -10,6 +10,7 @@ import pytest
 from mcp import Client
 
 import app.mcp_server as mcp_server
+import app.tools.memory_tools as memory_tools
 import app.tools.tasks as tasks_module
 from app.config import Settings
 from app.memory.store import MemoryStore
@@ -31,14 +32,20 @@ def _settings(**over):
 def store(monkeypatch):
     """An isolated store, installed everywhere the server reaches for one.
 
-    Both bindings are needed: the tool modules did ``from app.memory.store import
+    Every binding is needed: the tool modules did ``from app.memory.store import
     get_store`` at import time, so patching the store module alone would leave
     ``add_task`` writing to the real database — which is exactly the bug this
     fixture exists to prevent, and one a passing test would have hidden.
+
+    ``memory_tools`` joined the list when the server's ``search_memory`` stopped
+    being a private substring scan and started dispatching through the registry.
+    Without it that test passed for the wrong reason: the search found nothing, and
+    the "nothing matches 'penicillin'" message contains the word it was asserting on.
     """
     s = MemoryStore(":memory:")
     monkeypatch.setattr(mcp_server, "get_store", lambda: s)
     monkeypatch.setattr(tasks_module, "get_store", lambda: s)
+    monkeypatch.setattr(memory_tools, "get_store", lambda: s)
     yield s
     s.close()
 
@@ -60,6 +67,9 @@ def test_the_expected_resources_and_tools_are_registered(server):
         "amber://tasks/open",
         "amber://reminders/pending",
         "amber://memory/conversations{?limit}",
+        # The read-only window onto the self-review loop: reflections are written
+        # unattended, so seeing them from outside is how you judge them.
+        "amber://memory/reflections{?limit}",
     }
     assert {t.name for t in server.tool_policies()} == {
         "search_memory",
@@ -153,14 +163,17 @@ async def test_search_memory_finds_a_fact(server, store):
     async with Client(server.mcp) as client:
         result = await client.call_tool("search_memory", {"query": "penicillin"})
     text = result.content[0].text
-    assert "penicillin" in text
+    # The whole fact, not just the query echoed back in a miss message.
+    assert "Allergic to penicillin" in text
     assert "window seats" not in text
 
 
 async def test_search_memory_says_so_when_nothing_matches(server, store):
     async with Client(server.mcp) as client:
         result = await client.call_tool("search_memory", {"query": "nothing"})
-    assert "No stored facts" in result.content[0].text
+    # Same wording Amber gets, because it's the same tool — the MCP server used to
+    # have its own substring implementation that could drift from hers.
+    assert "Nothing in memory matches" in result.content[0].text
 
 
 async def test_a_failing_tool_returns_an_error_result_not_a_crash(server, store):

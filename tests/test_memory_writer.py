@@ -53,19 +53,70 @@ def store():
 
 
 # --- _parse_facts ---
+#
+# The extractor now returns records ({content, category, tier, replaces}), but a
+# cheap model reverts to a bare string array often enough that both shapes have to
+# parse. `_contents` keeps the assertions about the part that matters.
+
+def _contents(records):
+    return [r["content"] for r in records]
+
 
 def test_parse_facts_plain_json_array():
-    assert _parse_facts('["Likes tea", "Has a cat"]', 5) == ["Likes tea", "Has a cat"]
+    assert _contents(_parse_facts('["Likes tea", "Has a cat"]', 5)) == [
+        "Likes tea",
+        "Has a cat",
+    ]
+
+
+def test_parse_facts_object_form_carries_category_and_tier():
+    raw = '[{"fact": "Has a dog named Mango", "category": "relationship", "durable": true}]'
+    facts = _parse_facts(raw, 5)
+
+    assert facts == [
+        {
+            "content": "Has a dog named Mango",
+            "category": "relationship",
+            "tier": "durable",
+            "replaces": None,
+        }
+    ]
+
+
+def test_parse_facts_non_durable_object_lands_in_the_short_tier():
+    raw = '[{"fact": "Is redecorating the kitchen", "durable": false}]'
+    assert _parse_facts(raw, 5)[0]["tier"] == "short"
+
+
+def test_parse_facts_bare_string_defaults_to_short_and_no_category():
+    assert _parse_facts('["Likes tea"]', 5) == [
+        {"content": "Likes tea", "category": None, "tier": "short", "replaces": None}
+    ]
+
+
+def test_parse_facts_keeps_a_replaces_pointer():
+    raw = '[{"fact": "Lives in Denver", "replaces": "Lives in Boston"}]'
+    assert _parse_facts(raw, 5)[0]["replaces"] == "Lives in Boston"
+
+
+def test_parse_facts_rejects_an_unknown_category():
+    raw = '[{"fact": "Likes tea", "category": "beverages"}]'
+    assert _parse_facts(raw, 5)[0]["category"] is None
 
 
 def test_parse_facts_strips_code_fence():
     raw = '```json\n["Lives in Berlin"]\n```'
-    assert _parse_facts(raw, 5) == ["Lives in Berlin"]
+    assert _contents(_parse_facts(raw, 5)) == ["Lives in Berlin"]
 
 
 def test_parse_facts_falls_back_to_lines():
     raw = "- Likes tea\n- Has a cat"
-    assert _parse_facts(raw, 5) == ["Likes tea", "Has a cat"]
+    assert _contents(_parse_facts(raw, 5)) == ["Likes tea", "Has a cat"]
+
+
+def test_parse_facts_unwraps_a_facts_object():
+    raw = '{"facts": [{"fact": "Likes tea"}]}'
+    assert _contents(_parse_facts(raw, 5)) == ["Likes tea"]
 
 
 def test_parse_facts_empty_array():
@@ -78,7 +129,7 @@ def test_parse_facts_drops_none_sentinels():
 
 def test_parse_facts_respects_limit():
     raw = '["a", "b", "c", "d"]'
-    assert _parse_facts(raw, 2) == ["a", "b"]
+    assert _contents(_parse_facts(raw, 2)) == ["a", "b"]
 
 
 # --- extract_facts ---
@@ -91,8 +142,20 @@ async def test_extract_facts_uses_configured_model_and_parses():
         "I'm learning Spanish", "That's great!", settings=settings, runner=runner
     )
 
-    assert facts == ["Is learning Spanish"]
+    assert _contents(facts) == ["Is learning Spanish"]
     assert runner.calls[0]["system"]  # the extraction prompt was supplied
+
+
+async def test_extract_facts_attributes_spend_to_the_conversation():
+    """The brain passes conversation_id; the writer used to drop it, so its spend
+    was unattributable to the session that caused it."""
+    runner = FakeRunner("[]")
+
+    await extract_facts(
+        "hi", "hello", settings=_settings(), runner=runner, conversation_id="sess-1"
+    )
+
+    assert runner.calls[0]["conversation_id"] == "sess-1"
 
 
 async def test_extract_facts_short_circuits_on_empty_input():
@@ -122,6 +185,7 @@ async def test_remember_stores_new_facts_and_logs_exchange(store, monkeypatch):
 
 
 async def test_remember_dedupes_against_existing(store, monkeypatch):
+    """A repeat isn't 'stored' — it reinforces the row that already says it."""
     store.add_fact("Likes hiking")
 
     async def fake_extract(user_text, assistant_text, known=(), **kw):
@@ -131,8 +195,30 @@ async def test_remember_dedupes_against_existing(store, monkeypatch):
 
     stored = await remember("x", "y", store=store, settings=_settings())
 
-    assert stored == ["New fact"]  # the duplicate was not re-stored
+    assert stored == ["New fact"]  # only the genuinely new one is reported
     assert store.fact_count() == 2
+    # ...and the repeat left evidence that it came up again.
+    hiking = next(f for f in store.all_facts() if f["content"] == "Likes hiking")
+    assert hiking["use_count"] == 1
+
+
+async def test_remember_supersedes_a_contradicted_fact(store, monkeypatch):
+    store.add_fact("Lives in Boston")
+
+    async def fake_extract(user_text, assistant_text, known=(), **kw):
+        return [{"fact": "Lives in Denver", "replaces": "Lives in Boston"}]
+
+    monkeypatch.setattr(writer, "extract_facts", fake_extract)
+
+    stored = await remember("I moved to Denver", "Nice!", store=store, settings=_settings())
+
+    assert stored == ["Lives in Denver"]
+    # The old fact is gone from the active set, but still on record, pointing at
+    # its replacement — so a bad correction is recoverable.
+    assert [f["content"] for f in store.all_facts()] == ["Lives in Denver"]
+    old = store.get_fact(1)
+    assert old["status"] == "superseded"
+    assert old["superseded_by"] == store.all_facts()[0]["id"]
 
 
 async def test_remember_passes_known_facts_to_extractor(store, monkeypatch):
@@ -147,6 +233,66 @@ async def test_remember_passes_known_facts_to_extractor(store, monkeypatch):
 
     await remember("x", "y", store=store, settings=_settings())
     assert "Already known" in seen_known["known"]
+
+
+async def test_remember_shows_the_extractor_relevant_facts_not_just_recent(
+    store, monkeypatch
+):
+    """The known-facts list is searched, not sampled.
+
+    It used to be the N most recently stored facts, so once the store outgrew N the
+    extractor was blind to everything older and re-proposed near-duplicates of facts
+    it couldn't see.
+    """
+    store.add_fact("Has a dog named Mango")
+    for i in range(12):
+        store.add_fact(f"unrelated filler fact {i}")
+
+    seen_known = {}
+
+    async def fake_extract(user_text, assistant_text, known=(), **kw):
+        seen_known["known"] = list(known)
+        return []
+
+    monkeypatch.setattr(writer, "extract_facts", fake_extract)
+
+    await remember(
+        "my dog Mango needs a walk", "Sounds good.",
+        store=store, settings=_settings(memory_max_facts=5),
+    )
+
+    # The relevant old fact surfaced despite 12 newer ones burying it.
+    assert "Has a dog named Mango" in seen_known["known"]
+
+
+async def test_remember_logs_the_exchange_even_when_extraction_fails(store, monkeypatch):
+    """Logging comes first now.
+
+    It used to run after extraction, so a failed extraction — or a barge-in
+    cancelling this coroutine — lost the raw conversation record too.
+    """
+    async def boom(*a, **k):
+        raise RuntimeError("model unavailable")
+
+    monkeypatch.setattr(writer, "extract_facts", boom)
+
+    with pytest.raises(RuntimeError):
+        await remember("what's the weather", "It's sunny.", store=store, settings=_settings())
+
+    assert [m["content"] for m in store.recent_messages(10)] == [
+        "what's the weather",
+        "It's sunny.",
+    ]
+
+
+async def test_remember_drops_a_rambling_fact(store, monkeypatch):
+    async def fake_extract(user_text, assistant_text, known=(), **kw):
+        return ["x" * 500, "Likes tea"]
+
+    monkeypatch.setattr(writer, "extract_facts", fake_extract)
+
+    stored = await remember("x", "y", store=store, settings=_settings())
+    assert stored == ["Likes tea"]
 
 
 async def test_remember_noop_when_memory_disabled(store, monkeypatch):

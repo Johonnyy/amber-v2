@@ -1,9 +1,9 @@
-"""Task tools — add, list, and complete the user's to-dos (Phase 4).
+"""Task tools — add, list, and complete the user's to-dos.
 
-These are the lightweight, inline counterpart to the OpenClaw bridge: they touch
-only Amber's own SQLite store (the ``tasks`` table from Phase 3), so they're fast
-and need no network. The context builder already *surfaces* open tasks into the
-prompt each turn; these tools let the model *mutate* the list during a turn.
+The lightweight, inline kind of tool: they touch only Amber's own SQLite store, so
+they're fast and need no network (anything heavier goes to a peer MCP server). The
+context builder already *surfaces* open tasks into the prompt each turn, with their
+ids; these tools let the model *mutate* the list during a turn.
 
 Store access goes through ``get_store()`` (the process singleton) wrapped in
 ``asyncio.to_thread`` so the synchronous SQLite call never blocks the event loop.
@@ -20,8 +20,10 @@ from app.tools.registry import registry
 @registry.register(
     name="add_task",
     description=(
-        "Add a to-do item to the user's task list. Use when the user asks you to "
-        "remember to do something later, or to track/add a task."
+        "Add a to-do item to the user's task list. Use when they ask you to track "
+        "something they need to do. If they gave a specific time to be reminded "
+        "at, use set_reminder instead. For a fact about the user rather than "
+        "something to do, use remember_fact."
     ),
     input_schema={
         "type": "object",
@@ -44,8 +46,13 @@ async def add_task(description: str) -> str:
 
 @registry.register(
     name="list_tasks",
-    description="List the user's open (not-yet-done) tasks, with their ids.",
+    description=(
+        "List the user's open (not-yet-done) tasks, with their ids. The current "
+        "ones are usually already in your context — call this only when the user "
+        "asks for the whole list, or when you need an id you don't have."
+    ),
     input_schema={"type": "object", "properties": {}},
+    read_only=True,
 )
 async def list_tasks() -> str:
     tasks = await asyncio.to_thread(get_store().open_tasks)
@@ -76,4 +83,6 @@ async def complete_task(task_id: int) -> str:
     ok = await asyncio.to_thread(get_store().complete_task, int(task_id))
     if ok:
         return f"Marked task #{task_id} done."
-    return f"No open task #{task_id} to complete."
+    return (
+        f"Error: no open task #{task_id} — call list_tasks to find the right id."
+    )

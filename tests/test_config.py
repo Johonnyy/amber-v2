@@ -33,7 +33,10 @@ def test_tool_defaults():
     assert s.feature_tools is True
     # Self-dispatched search: the native Anthropic server tool went with the brain
     # swap, since a server tool only exists inside a provider's own request loop.
-    assert s.search_provider == "duckduckgo"
+    # "auto" resolves to tavily when a key is present and duckduckgo when it isn't,
+    # so a default install searches without configuration and a keyed one searches
+    # well — see app/tools/search.py::resolve_provider.
+    assert s.search_provider == "auto"
     assert s.mcp_peers == ""  # no peer agents until configured
     assert s.max_tool_iterations == 5
 

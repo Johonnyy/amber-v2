@@ -142,6 +142,15 @@ class ClientTools:
         """Anthropic schemas for every currently declared client tool."""
         return list(self._specs.values())
 
+    def names(self) -> list[str]:
+        """The declared tool names, for describing this device in the prompt.
+
+        The persona used to hard-code a paragraph about "display tools" whether or
+        not the connected device had any. Naming what was actually declared means
+        the description can't drift from the device.
+        """
+        return list(self._specs)
+
     def handles(self, name: str) -> bool:
         """True if ``name`` is one of this client's declared tools."""
         return name in self._specs

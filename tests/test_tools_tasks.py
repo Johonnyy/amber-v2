@@ -42,4 +42,7 @@ async def test_complete_task_marks_done(store):
 
 async def test_complete_unknown_task_reports_no_change(store):
     msg = await tasks.complete_task(999)
-    assert "No open task" in msg
+    # Failures say what to do next, so the model recovers instead of retrying the
+    # same bad call.
+    assert "no open task #999" in msg
+    assert "list_tasks" in msg

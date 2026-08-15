@@ -33,7 +33,6 @@ permanently uncallable rather than safely gated. When that frame lands, revisit.
 
 from __future__ import annotations
 
-import asyncio
 import logging
 from functools import lru_cache
 
@@ -111,17 +110,26 @@ def build_server(settings: Settings | None = None) -> AgentMCPServer:
         """The most recent logged exchanges, oldest first."""
         return get_store().recent_messages(limit)
 
+    @mcp.resource("amber://memory/reflections{?limit}")
+    def recent_reflections(limit: int = 10) -> list[dict]:
+        """What Amber's maintenance pass has noticed about how conversations go.
+
+        The read-only window onto the self-review loop: these notes are written
+        unattended, so being able to see them from outside is how you tell whether
+        they're worth acting on.
+        """
+        return get_store().recent_reflections(limit)
+
     # --- tools: the same actions, through the same registry ---
 
     @mcp.tool(read_only=True)
     async def search_memory(query: str, limit: int = 10) -> str:
         """Search Amber's distilled facts about the user for a word or phrase."""
-        facts = await asyncio.to_thread(get_store().all_facts)
-        needle = (query or "").strip().lower()
-        matches = [f for f in facts if needle in f["content"].lower()][: max(1, limit)]
-        if not matches:
-            return f"No stored facts match {query!r}."
-        return "\n".join(f"- {f['content']}" for f in matches)
+        # Dispatched through the registry rather than reimplemented here. This used
+        # to be a private substring scan over every fact — a parallel code path that
+        # was both worse (no ranking, no index) and free to drift from what Amber
+        # herself sees when she searches her own memory.
+        return await run_tool("search_memory", {"query": query, "limit": limit})
 
     @mcp.tool(read_only=True)
     async def list_tasks() -> str:
