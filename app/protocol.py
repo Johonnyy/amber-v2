@@ -61,6 +61,22 @@ how Amber sounds without an edit and a restart on the server:
     is the truth about what the next sentence will sound like.
 A client that sends neither gets the install's configured voice, exactly as before.
 
+Model selection adds one *additive* frame in each direction, the exact peer of the
+voice pair above, so a client can choose *which brain answers* — and what a keyword
+means — without an edit and a restart on the server:
+  * ``set_model`` (client -> server) — two independent things, either or both:
+    ``keyword`` picks the model for **this connection** (``null`` = back to the
+    server's configured default), and ``map`` re-points keywords **for the whole
+    install** (``{"coding": "vendor/model"}``, a ``null`` value resetting one to its
+    built-in default). The map is applied first, so one frame can invent a keyword
+    and select it.
+  * ``model`` (server -> client) — what this connection resolves to, plus the whole
+    keyword catalogue with each keyword's description and what it points at. Sent
+    once right after ``voice``, and again after every ``set_model``. Like ``voice``,
+    it is the acknowledgment: a value that failed validation is dropped silently and
+    this frame — never the patch — says what took effect.
+A client that sends neither uses ``AMBER_LLM_TIER``, exactly as before.
+
 Turn-based conversations extend ``turn_complete`` *additively* with an optional
 ``awaiting_response`` field: ``True`` when Amber asked something it expects the user
 to answer, so the client should keep the mic open and send the next utterance as a
@@ -78,6 +94,7 @@ USER_TEXT = "user_text"  # a typed utterance, taken verbatim instead of transcri
 REGISTER_TOOLS = "register_tools"  # client declares tools Amber may call on it
 TOOL_RESULT = "tool_result"  # the result of a client-side tool call (see TOOL_CALL)
 SET_VOICE = "set_voice"  # patch how Amber sounds on this connection
+SET_MODEL = "set_model"  # pick this connection's brain, and/or re-point a keyword
 
 # --- server -> client message types ---
 READY = "ready"  # handshake accepted; server is listening
@@ -88,6 +105,7 @@ TURN_COMPLETE = "turn_complete"  # the full response has been sent
 MEMORY = "memory"  # what Amber currently remembers about the user (advisory)
 TOOL_CALL = "tool_call"  # asks the client to run one of its declared tools
 VOICE = "voice"  # the voice settings in effect, and what this Amber accepts
+MODEL = "model"  # the brain in effect, and the keyword catalogue behind it
 ERROR = "error"  # something went wrong this turn
 
 # --- error codes (the optional ``code`` field on an error frame) ---
@@ -204,6 +222,30 @@ def voice(
     something that will silently snap back.
     """
     frame: dict[str, Any] = {"type": VOICE, "settings": dict(settings)}
+    if options is not None:
+        frame["options"] = dict(options)
+    if locked:
+        frame["locked"] = True
+    return frame
+
+
+def model(
+    settings: dict[str, Any],
+    options: dict[str, Any] | None = None,
+    *,
+    locked: bool = False,
+) -> dict[str, Any]:
+    """Which brain this connection is talking to, and the catalogue behind it.
+
+    ``settings`` is `app.models.state()` — the keyword in effect, the model id it
+    resolves to *right now*, the server's own default keyword, and whether this
+    connection chose one at all. ``options`` is `app.models.options()`: every keyword
+    with its description and where it points, so a picker is built from what this
+    Amber actually knows rather than a hardcoded list that drifts the moment a
+    keyword is invented. ``locked`` is ``True`` when ``AMBER_FEATURE_MODEL_CONTROL``
+    is off and ``set_model`` is being ignored — show the values, disable the controls.
+    """
+    frame: dict[str, Any] = {"type": MODEL, "settings": dict(settings)}
     if options is not None:
         frame["options"] = dict(options)
     if locked:

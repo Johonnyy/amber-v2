@@ -86,6 +86,13 @@ class Session:
     # mid-conversation; the ``voice`` frame on the next ``ready`` tells the client
     # what it resumed with.
     voice: VoiceSettings = field(default_factory=VoiceSettings.from_settings)
+    # Which brain answers on *this* connection, as a keyword (`app.models`). ``None``
+    # means "whatever the install is configured for", which is deliberately not the
+    # same as storing that keyword: a connection that never chose should follow
+    # ``AMBER_LLM_TIER`` if it changes, and one that did should not. Retained across a
+    # reconnect like the voice, and read once per turn so a switch mid-reply lands on
+    # the next turn rather than halfway through this one.
+    model_keyword: str | None = None
 
 
 class SessionManager:

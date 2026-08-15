@@ -15,6 +15,7 @@ rather than in production.
 import pytest
 
 import app.brain as brain
+from app import models
 from app.config import Settings
 
 
@@ -123,12 +124,36 @@ async def test_the_persona_prompt_is_the_default_system(recorder, monkeypatch):
 # --- tier and settings injection ---
 
 
-async def test_the_named_tier_is_used_not_a_model_id(recorder, monkeypatch):
-    """Model choice is a tier resolved by agent_runtime's router, so upgrading every
-    app is one edit there rather than one per app."""
+async def test_the_keyword_is_resolved_before_the_runner_sees_it(recorder, monkeypatch):
+    """Model choice is a keyword (`app.models`) resolved here, at the last moment.
+
+    The runner gets a concrete id rather than the word, because Amber's vocabulary is
+    a superset of `agent_runtime`'s three tiers — handing it "coding" would raise.
+    """
     monkeypatch.setattr(brain, "get_settings", lambda: _settings(llm_tier="strong"))
     await _collect([{"role": "user", "content": "hi"}])
-    assert recorder.instances[0].model == "strong"
+    assert recorder.instances[0].model == models.BUILTIN_MODELS["strong"]
+
+
+async def test_a_connection_can_pick_its_own_keyword(recorder, monkeypatch):
+    """The per-connection override beats the install default for this turn only."""
+    monkeypatch.setattr(brain, "get_settings", lambda: _settings(llm_tier="balanced"))
+    await _collect([{"role": "user", "content": "hi"}], model="coding")
+    assert recorder.instances[0].model == models.BUILTIN_MODELS["coding"]
+
+
+async def test_a_literal_model_id_passes_through(recorder, monkeypatch):
+    """The escape hatch: anything with a "/" is already a model id."""
+    monkeypatch.setattr(brain, "get_settings", lambda: _settings(llm_tier="balanced"))
+    await _collect([{"role": "user", "content": "hi"}], model="vendor/experimental-1")
+    assert recorder.instances[0].model == "vendor/experimental-1"
+
+
+async def test_an_unknown_keyword_falls_back_rather_than_failing(recorder, monkeypatch):
+    """A typo must cost one reply from the default model, never the whole turn."""
+    monkeypatch.setattr(brain, "get_settings", lambda: _settings(llm_tier="balanced"))
+    await _collect([{"role": "user", "content": "hi"}], model="nonsense")
+    assert recorder.instances[0].model == models.BUILTIN_MODELS["balanced"]
 
 
 def test_runtime_settings_come_from_ambers_config_not_the_environment(monkeypatch):
@@ -140,7 +165,9 @@ def test_runtime_settings_come_from_ambers_config_not_the_environment(monkeypatc
     rs = brain.runtime_settings(_settings(memory_db_path="amber.db", llm_tier="cheap"))
     assert rs.app_name == "amber"
     assert rs.db_path == "amber.db"  # same file as memory + the MCP tool log
-    assert rs.default_tier == "cheap"
+    # Resolved, not forwarded: the runtime's fallback tier table knows three names
+    # and Amber's vocabulary is larger, so the id is what has to travel.
+    assert rs.default_tier == models.BUILTIN_MODELS["cheap"]
     assert rs.max_tokens == 256
     assert rs.max_steps == 4
 

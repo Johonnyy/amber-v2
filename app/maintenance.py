@@ -127,9 +127,12 @@ async def _run_model(system: str, payload: str, settings: Settings, runner=None)
         from agent_runtime import AgentRunner
 
         from app.brain import runtime_settings
+        from app.models import resolve as resolve_model
 
         runner = AgentRunner(
-            model=settings.maintenance_tier,
+            # A keyword (`app.models`), resolved here like the brain's and the
+            # writer's — the runtime only knows its own three tiers.
+            model=resolve_model(settings.maintenance_tier, settings),
             # No tools, deliberately: a step that tidies memory must not be able to
             # start doing things with it.
             broker=None,

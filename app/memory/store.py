@@ -12,6 +12,9 @@ Tables:
 * ``turn_events`` — lightweight telemetry (tool calls, barge-ins, corrections)
   the maintenance pass reflects on.
 * ``reflections`` — the maintenance pass's own notes about how Amber is doing.
+* ``model_keywords`` — where this install points a model keyword (`app.models`).
+  Not memory at all; it lives here because this is the file Amber already owns and
+  a second one would be a second thing to back up.
 
 **Facts are tiered.** Every fact carries a ``tier`` (``session`` / ``short`` /
 ``durable``), a ``confidence``, a ``status``, and usage counters. That is what lets
@@ -237,6 +240,34 @@ def _m5_fts(conn: sqlite3.Connection) -> None:
     conn.execute("INSERT INTO conversations_fts (conversations_fts) VALUES ('rebuild')")
 
 
+def _m6_model_keywords(conn: sqlite3.Connection) -> None:
+    """Where a model keyword points, for this install (see `app.models`).
+
+    Overrides only — a keyword left alone has no row, so a better built-in default
+    in a later release reaches every install that never re-pointed it. Storing the
+    full table instead would freeze today's defaults into the database on first
+    write, which is the opposite of what the built-ins are for.
+
+    Two columns exist for the sync store (`app.model_sync`), which shares this table
+    with every other app in the ecosystem. ``synced`` is 0 for a change made here
+    that the store has not accepted yet, and an empty ``model`` on such a row is a
+    **tombstone**: a reset made locally whose deletion still has to be pushed. Without
+    it, resetting a keyword while the store was unreachable would look identical to
+    never having had one, and the next pull would quietly bring the override back.
+    """
+    conn.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS model_keywords (
+            keyword     TEXT    PRIMARY KEY,
+            model       TEXT    NOT NULL,           -- '' = pending reset (tombstone)
+            description TEXT    NOT NULL DEFAULT '',
+            updated_at  TEXT    NOT NULL,
+            synced      INTEGER NOT NULL DEFAULT 0  -- 0 = not yet pushed to the store
+        );
+        """
+    )
+
+
 # Ordered; index + 1 is the schema version each one produces. Append only.
 _MIGRATIONS: tuple[Callable[[sqlite3.Connection], None], ...] = (
     _m1_baseline,
@@ -244,6 +275,7 @@ _MIGRATIONS: tuple[Callable[[sqlite3.Connection], None], ...] = (
     _m3_indexes,
     _m4_events_and_reflections,
     _m5_fts,
+    _m6_model_keywords,
 )
 
 # The FTS migration is allowed to fail (old SQLite); the rest are not.
@@ -1052,6 +1084,109 @@ class MemoryStore:
                 "SELECT MAX(created_at) AS at FROM reflections"
             ).fetchone()
         return row["at"] if row and row["at"] else None
+
+    # --- model keywords (see app/models.py) ---
+
+    def model_keywords(self, *, pending: bool | None = None) -> dict[str, dict]:
+        """This install's keyword overrides, as ``{keyword: {model, ...}}``.
+
+        Includes tombstones (``model == ""``) — the resolver filters them, and the
+        sync pass needs to see them. ``pending=True`` narrows to rows the store has
+        not accepted yet, which is exactly the push queue.
+        """
+        sql = (
+            "SELECT keyword, model, description, updated_at, synced FROM model_keywords"
+        )
+        if pending is True:
+            sql += " WHERE synced = 0"
+        elif pending is False:
+            sql += " WHERE synced = 1"
+        with self._lock:
+            rows = self._conn.execute(sql).fetchall()
+        return {
+            r["keyword"]: {
+                "model": r["model"],
+                "description": r["description"],
+                "updated_at": r["updated_at"],
+                "synced": bool(r["synced"]),
+            }
+            for r in rows
+        }
+
+    def set_model_keyword(
+        self,
+        keyword: str,
+        model: str,
+        *,
+        description: str | None = None,
+        synced: bool = False,
+    ) -> None:
+        """Point a keyword at a model. Upsert — one row per keyword, always.
+
+        ``description=None`` keeps whatever is stored, matching the sync store's own
+        rule: the common write is re-pointing a keyword somebody else named, and
+        blanking the explanation each time would empty the table of meaning.
+        ``synced`` is set by the sync pass when writing what it just read; a local
+        edit leaves it false so the next pass pushes it.
+        """
+        with self._lock:
+            self._conn.execute(
+                "INSERT INTO model_keywords (keyword, model, description, updated_at, synced) "
+                "VALUES (?, ?, ?, ?, ?) ON CONFLICT(keyword) DO UPDATE SET "
+                "model = excluded.model, "
+                "description = CASE WHEN ? IS NULL THEN model_keywords.description "
+                "                   ELSE excluded.description END, "
+                "updated_at = excluded.updated_at, synced = excluded.synced",
+                (keyword, model, description or "", _now(), int(synced), description),
+            )
+            self._conn.commit()
+
+    def clear_model_keyword(self, keyword: str) -> None:
+        """Drop an override, so the keyword means its built-in default again.
+
+        A row the store has never accepted is simply deleted — there is nothing
+        elsewhere to undo. One it *has* accepted becomes a tombstone instead, so the
+        deletion survives until the store takes it; otherwise resetting a keyword
+        while the store was unreachable would be silently reverted by the next pull.
+
+        Note this is a hard delete either way, unlike every other deletion in this
+        store. The soft-delete discipline exists because a forgotten *fact* is
+        unrecoverable knowledge; a removed override just means "use the default",
+        which is fully described by the row's absence and re-creatable in one click.
+        """
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT synced FROM model_keywords WHERE keyword = ?", (keyword,)
+            ).fetchone()
+            if row is None:
+                return
+            if row["synced"]:
+                self._conn.execute(
+                    "UPDATE model_keywords SET model = '', updated_at = ?, synced = 0 "
+                    "WHERE keyword = ?",
+                    (_now(), keyword),
+                )
+            else:
+                self._conn.execute(
+                    "DELETE FROM model_keywords WHERE keyword = ?", (keyword,)
+                )
+            self._conn.commit()
+
+    def drop_model_keyword(self, keyword: str) -> None:
+        """Remove the row outright, tombstone or not. The sync pass's own eraser."""
+        with self._lock:
+            self._conn.execute(
+                "DELETE FROM model_keywords WHERE keyword = ?", (keyword,)
+            )
+            self._conn.commit()
+
+    def mark_model_keyword_synced(self, keyword: str) -> None:
+        """Record that the store has accepted this row as it stands."""
+        with self._lock:
+            self._conn.execute(
+                "UPDATE model_keywords SET synced = 1 WHERE keyword = ?", (keyword,)
+            )
+            self._conn.commit()
 
 
 @lru_cache

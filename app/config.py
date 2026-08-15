@@ -76,12 +76,12 @@ class Settings(BaseSettings):
     # Free-text direction for the voice ("warm, brisk, dry"). Only ``gpt-4o-mini-tts``
     # acts on it; it is not sent to the older models, which reject it.
     tts_instructions: str = ""
-    # The brain, as a **named tier** rather than a model id. agent_runtime's
-    # model_router resolves "balanced" -> a concrete model, so upgrading every app
-    # in the ecosystem is one edit in the router rather than one per app. Today
-    # "balanced" is Claude Haiku, which is what Amber used before this indirection
-    # existed — fast and low-latency, which is what a voice loop needs. A literal
-    # model id containing "/" still passes through as an escape hatch.
+    # The brain, as a **keyword** rather than a model id — you say what you want the
+    # model to be like ("fast", "coding", "strong") and `app/models.py` resolves it.
+    # This is the *default*: a connection can pick another keyword for itself with a
+    # ``set_model`` frame, and the keyword table itself is re-pointable at runtime
+    # (see app/models.py). A literal model id containing "/" still passes through
+    # untouched as an escape hatch.
     llm_tier: str = "balanced"
     # Cap on a single spoken reply. Voice answers are short; keep this modest so
     # a runaway generation can't stream for minutes. Bump it for longer replies.
@@ -245,6 +245,12 @@ class Settings(BaseSettings):
     # every client) rather than a security boundary. The ``voice`` frame is still
     # sent either way, so a client can show what it is getting.
     feature_voice_control: bool = True
+    # When false, ``set_model`` frames are ignored: every connection uses ``llm_tier``
+    # and the keyword table can't be re-pointed over the wire (the ``.env`` and the
+    # database still decide it). Like voice control this is a preference, not a
+    # security boundary — a client can only ever name a model, and the ``model`` frame
+    # is still sent so it can show what it is getting, marked ``locked``.
+    feature_model_control: bool = True
     # Turn-based conversations: when true, the brain offers the ``expect_reply``
     # signaling tool so Amber can deliberately hold a turn open for the user's
     # answer (``turn_complete`` then carries ``awaiting_response``). When false the
@@ -277,9 +283,21 @@ class Settings(BaseSettings):
     # register with the hosted sync store; she serves normally without it.
     mcp_public_url: str = ""
     # The hosted discovery store. Empty disables registration, and an unreachable
-    # one never blocks startup.
+    # one never blocks startup. It also holds the ecosystem's shared model-keyword
+    # table (see feature_model_sync below and app/model_sync.py).
     mcp_sync_store_url: str = ""
     mcp_sync_store_token: str = ""
+
+    # --- Shared model keywords ---
+    # Push Amber's keyword overrides to the sync store and pull everyone else's, so
+    # "coding" means the same model in every app. Requires mcp_sync_store_url; with
+    # no store configured this does nothing and the table is simply local. Off means
+    # Amber keeps her own table and never talks to the store about it.
+    feature_model_sync: bool = True
+    # How often the reconciliation pass runs. Keyword changes are rare and a client
+    # edit pushes immediately, so this is the catch-up for changes made elsewhere.
+    # Floored at 30s in the loop.
+    model_sync_interval_s: float = 300.0
 
     # --- Sessions (Phase 5) ---
     # How long an idle session's in-memory history is retained for reconnect/

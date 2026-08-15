@@ -205,6 +205,38 @@ place — on a model that ignores speed, a non-default speed becomes a pacing se
 prepended to the instructions, so the knob means one thing on both rather than
 silently doing nothing on the better-sounding model.
 
+**Model choice is per-connection too, and by keyword.** You pick a brain by
+*describing* it — `fast`, `cheap`, `balanced`, `strong`, `coding`, `reasoning`,
+`writing`, `research`, `vision`, `long` — and `app/models.py` resolves the word to an
+OpenRouter id at the last possible moment, inside `think`. Three layers, in order: a
+literal id (anything with a `/`) passes through; then this install's overrides, rows
+in SQLite; then the built-in defaults. Resolution **never raises** on the turn path —
+an unknown keyword falls back to the install default and logs, because a typo in
+`.env` must cost one reply from the wrong model, not every reply.
+
+Two things move at runtime, and they are different scopes. `set_model`'s `keyword`
+picks the brain for *this connection* (`null` = back to `AMBER_LLM_TIER`), lives on
+the `Session` beside the voice, and is read once per turn. Its `map`
+(`{"coding": "vendor/model"}`, `null` to reset) re-points what a keyword *means* for
+the whole install, is persisted, and outlives the socket — the map is applied first,
+so one frame can invent a keyword and select it. The `model` frame answers with the
+effective values plus the whole catalogue (each keyword's description, what it points
+at, what it would point at untouched), so a picker is built from the wire. Gated by
+`AMBER_FEATURE_MODEL_CONTROL`; off marks the frame `locked`. `memory_tier` and
+`maintenance_tier` are keywords through the same table, resolved where their runners
+are built.
+
+**The keyword table is shared with the ecosystem.** `app/model_sync.py` pushes this
+install's overrides to the sync store's `/models` and pulls everyone else's, so
+`coding` means one model in every app rather than one per repo. Local always wins
+until it is pushed: a change is written to SQLite and takes effect on the next turn
+whether or not the store is reachable, and reconciliation is a background pass (on
+startup, on a timer, and immediately after a client edit). A reset while the store is
+down leaves a **tombstone** — a row with an empty model — because otherwise the next
+pull would silently restore the override. With no `AMBER_MCP_SYNC_STORE_URL` the
+whole module is inert and the table is simply Amber's. Conflicts are last-write-wins,
+which is the honest fit for a one-person ecosystem.
+
 **Typed turns.** `user_text` (`{"type": "user_text", "text": "..."}`) is the exact peer
 of a binary utterance: it takes a turn slot, obeys the same rate limit and session cap,
 and barges in on an in-flight turn identically. The *only* difference is that STT is
@@ -241,8 +273,9 @@ lives only in memory (SQLite), not in conversation history. Don't conflate the t
 All model choices, API keys, and feature flags go through `app/config.py` (env prefix
 `AMBER_`, plus `.env`). Don't hardcode model names or keys inline — route them through
 config so the brain, STT, and TTS models are swappable. Brain model choice is a
-**named tier** (`llm_tier`) resolved by `agent_runtime.model_router`, not a literal
-model id.
+**keyword** (`llm_tier`) resolved by `app/models.py`, not a literal model id — and
+only the *default*, since a connection can pick another and the table itself is
+re-pointable at runtime.
 
 **One prefix, three consumers.** Amber embeds `agent_runtime` and `agent_mcp`, both
 of which can read their own `AGENT_RUNTIME_*` / `AGENT_MCP_*` environment. Amber uses
@@ -278,7 +311,9 @@ is `deploy/amber.service`; runs `uvicorn app.main:app` under user `amber` from
 `/opt/amber`, config from `/opt/amber/.env`. Update: `git pull` then `systemctl restart
 amber`.
 
-Key modules: [app/config.py](app/config.py) (all tiers/keys/flags),
+Key modules: [app/config.py](app/config.py) (all keywords/keys/flags),
+[app/models.py](app/models.py) (the model keyword catalogue) and
+[app/model_sync.py](app/model_sync.py) (sharing it through the sync store),
 [app/protocol.py](app/protocol.py) (WS wire contract),
 [app/sentence_splitter.py](app/sentence_splitter.py) (streaming seam),
 [app/pipeline.py](app/pipeline.py) (the voice loop), [app/main.py](app/main.py)
@@ -540,9 +575,10 @@ All three changes landed, and the voice loop and WS protocol are untouched:
 - **Amber**: all 5 phases, the ecosystem refactor above, and the memory/prompt
   overhaul (tiered self-curating memory with migrations and FTS retrieval, a
   composed modality-aware prompt, memory-management tools, `auto` search +
-  `read_url`, telemetry, and the unattended maintenance pass). Voice pipeline
-  complete, streaming seam intact, 377 tests in `tests/`. Runs on `agent-runtime`
-  and serves her own MCP server.
+  `read_url`, telemetry, and the unattended maintenance pass), plus per-connection
+  voice and model control with a keyword table shared through the sync store. Voice
+  pipeline complete, streaming seam intact, 436 tests in `tests/`. Runs on
+  `agent-runtime` and serves her own MCP server.
   - **Not yet done here:** reminders still can't *fire* — they're recorded,
     listable and completable, but delivery needs a server-initiated protocol frame.
     The maintenance scheduler makes that a small follow-on. Long-term memory as
@@ -557,26 +593,30 @@ All three changes landed, and the voice loop and WS protocol are untouched:
   Switch the pins in `pyproject.toml` to `@v0.1.0` once they are.
 - **agent-spawner**: not yet built.
 - **notification-relay**: not yet built.
-- **Hosted sync store**: not yet built, so peer discovery is the static
-  `AMBER_MCP_PEERS` map. That is the designed fallback, not a workaround.
-- **amber-infra / amber-template**: specced, not yet built.
+- **Hosted sync store**: **built**, in `amber-infra/sync-store` — the server registry,
+  Aperture's config blobs, and (new) the shared model-keyword table at `/models`.
+  `AMBER_MCP_PEERS` remains the designed fallback when no store is configured, not a
+  workaround.
+- **amber-infra**: built out around the sync store (Caddy, install, deploy, backups).
+  **amber-template**: specced, not yet built.
 - **All individual app agents (finance, school, etc.)**: not yet started.
   Finance-agent is the intended first proof point, and is now unblocked — it can be
   built directly on `agent-mcp-py`.
 - **FreeCallMe MCP sidecar**: not started — intended as the proof point for the
   "compose external services, don't rewrite the app" pattern.
-- **Aperture**: not started, deliberately last — needs enough real agent value to be
-  worth unifying before building the shell.
+- **Aperture**: under way ahead of its planned slot — Electron shell with the chat
+  view, SSH/servers management, Bloom, and the Settings page that drives Amber's
+  voice and model controls over the WS protocol.
 
 ## Build order (current)
 
 1. ~~`agent-mcp-py`~~ — done
 2. ~~`agent-runtime`~~ — done
 3. ~~Amber refactor~~ — done (OpenClaw out, brain on `agent-runtime`, own MCP server)
-4. Hosted config sync store (small; can live inside `notification-relay` or
-   standalone). Until it exists, peers are the static `AMBER_MCP_PEERS` map, and
-   `sync_client`'s assumed shape (`POST /servers`, `GET /servers`) needs checking
-   against the real thing.
+4. ~~Hosted config sync store~~ — done, as `amber-infra/sync-store`: `/servers`
+   (registration + discovery), `/models` (the shared keyword table) and `/config`.
+   Peers still fall back to the static `AMBER_MCP_PEERS` map when no store is
+   configured.
 5. `agent-spawner`
 6. `finance-agent` as first full proof point
 7. FreeCallMe MCP sidecar

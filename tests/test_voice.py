@@ -176,9 +176,11 @@ def fresh_caches():
 
 
 def _handshake(ws) -> dict:
+    """Consume ``ready`` + ``voice`` + ``model``, returning the voice frame."""
     assert ws.receive_json()["type"] == protocol.READY
     frame = ws.receive_json()
     assert frame["type"] == protocol.VOICE
+    assert ws.receive_json()["type"] == protocol.MODEL
     return frame
 
 
@@ -238,6 +240,7 @@ def test_voice_survives_a_reconnect_with_the_same_session(faked_io):
     with client.websocket_connect("/ws") as ws:
         session_id = ws.receive_json()["session_id"]
         assert ws.receive_json()["type"] == protocol.VOICE
+        assert ws.receive_json()["type"] == protocol.MODEL
         ws.send_json({"type": "set_voice", "voice": "sage"})
         ws.receive_json()
 

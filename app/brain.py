@@ -38,6 +38,13 @@ keeping was the newline flush at a tool boundary, and that now lives in
 The runner is rebuilt per turn rather than cached, because the broker binds this
 turn's client tools, signals and conversation id. That costs one small object;
 caching it would mean leaking one turn's state into the next.
+
+**Which model** is decided here too, and late. `think` takes a *keyword* — the
+connection's own, or the install default — and `app.models.resolve` turns it into a
+concrete OpenRouter id on the spot, because both halves move at runtime now: a client
+can switch keyword between turns, and the keyword itself can be re-pointed at a
+different model without a restart. Resolving any earlier would cache a decision that
+is meant to be changeable.
 """
 
 from __future__ import annotations
@@ -61,6 +68,7 @@ from agent_runtime import Settings as RuntimeSettings
 from agent_mcp.registry import load_static_peers
 
 from app.config import Settings, get_settings
+from app.models import resolve as resolve_model
 from app.persona import SYSTEM_PROMPT
 from app.tools import get_tool_schemas, run_tool
 
@@ -97,7 +105,10 @@ def runtime_settings(settings: Settings | None = None) -> RuntimeSettings:
         _env_file=None,
         openrouter_api_key=settings.openrouter_api_key,
         app_name="amber",
-        default_tier=settings.llm_tier,
+        # Resolved here, not passed as a keyword: Amber's keyword table is a superset
+        # of the runtime's own three tiers, so handing "coding" to a library that has
+        # never heard of it would raise `UnknownTier` on the fallback path.
+        default_tier=resolve_model(settings.llm_tier, settings),
         max_tokens=settings.llm_max_tokens,
         max_steps=settings.max_tool_iterations,
         # Cost rows go in Amber's own database, beside her memory and the MCP
@@ -177,6 +188,7 @@ async def think(
     client_tools: "ClientTools | None" = None,
     signals: "TurnSignals | None" = None,
     conversation_id: str | None = None,
+    model: str | None = None,
 ) -> AsyncIterator[str]:
     """Stream Amber's reply for the given conversation history.
 
@@ -194,6 +206,11 @@ async def think(
     this turn's model spend and tool calls together in the usage tables and
     forwarded to any peer agent Amber calls.
 
+    ``model`` is this connection's chosen keyword (`app.models`) — ``None`` uses the
+    install's ``llm_tier``. It is resolved to a concrete model id here, at the last
+    possible moment, so a keyword re-pointed between two turns takes effect on the
+    second one without anything being invalidated or restarted.
+
     Yields text deltas as they arrive. Tool round trips happen inside and are
     invisible here, apart from a newline at each tool boundary so speech before a
     tool reaches TTS without waiting for the tool to finish.
@@ -202,17 +219,21 @@ async def think(
     system = system if system is not None else SYSTEM_PROMPT
     broker = build_broker(settings, client_tools=client_tools, signals=signals)
 
+    keyword = model or settings.llm_tier
+    resolved = resolve_model(keyword, settings)
+
     runner = AgentRunner(
-        model=settings.llm_tier,
+        model=resolved,
         broker=broker,
         settings=runtime_settings(settings),
     )
 
     logger.debug(
-        "LLM: %d message(s), tools=%s -> tier %s",
+        "LLM: %d message(s), tools=%s -> %s (%s)",
         len(messages),
         broker is not None,
-        settings.llm_tier,
+        resolved,
+        keyword,
     )
 
     async for text in runner.stream(

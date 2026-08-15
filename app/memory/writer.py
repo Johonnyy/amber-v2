@@ -188,9 +188,13 @@ async def extract_facts(
         from agent_runtime import AgentRunner
 
         from app.brain import runtime_settings
+        from app.models import resolve as resolve_model
 
         runner = AgentRunner(
-            model=settings.memory_tier,
+            # A keyword, resolved here for the same reason the brain does it —
+            # `memory_tier` may name one of Amber's own keywords, which the runtime's
+            # three-tier table has never heard of.
+            model=resolve_model(settings.memory_tier, settings),
             # No tools: this is a single extraction call, and offering tools to it
             # would let a fact-distillation step start doing things.
             broker=None,

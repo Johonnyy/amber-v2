@@ -31,7 +31,7 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, status
 
-from app import protocol, signals
+from app import model_sync, models, protocol, signals
 from app.config import Settings, get_settings
 from app.pipeline import run_turn
 from app.session import Session, SessionManager, get_session_manager
@@ -71,6 +71,11 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         from app.maintenance import maintenance_loop
 
         background.append(asyncio.create_task(maintenance_loop(settings)))
+    if model_sync.sync_enabled(settings):
+        # The ecosystem's shared keyword table. Reconciles immediately, so a keyword
+        # re-pointed elsewhere while this box was down is in effect for the first
+        # turn after a restart rather than five minutes into it.
+        background.append(asyncio.create_task(model_sync.sync_loop(settings)))
 
     try:
         if not settings.mcp_server_enabled:
@@ -155,6 +160,10 @@ async def voice_socket(websocket: WebSocket) -> None:
             locked=not settings.feature_voice_control,
         )
     )
+    # And which brain is answering, on the same terms — sent unconditionally so a
+    # client can show the model without asking, and additive so one that doesn't know
+    # the frame ignores it.
+    await websocket.send_json(_model_frame(session, settings))
     logger.info(
         "[%s] Client %s (%d turn(s) of history)",
         session.id,
@@ -238,6 +247,20 @@ async def voice_socket(websocket: WebSocket) -> None:
         # The manager's TTL reclaims it if the client never comes back.
         manager.touch(session)
         logger.info("[%s] Session detached (retained for resume)", session.id)
+
+
+def _model_frame(session: Session, settings: Settings) -> dict:
+    """The ``model`` frame for this connection, catalogue included.
+
+    Built in one place because it goes out on the handshake and again after every
+    ``set_model``, and the two must agree — a client comparing them to decide whether
+    its request took effect is the whole acknowledgment mechanism.
+    """
+    return protocol.model(
+        models.state(session.model_keyword, settings),
+        models.options(settings),
+        locked=not settings.feature_model_control,
+    )
 
 
 async def _admit_utterance(
@@ -346,6 +369,29 @@ async def _handle_control(
                 locked=not settings.feature_voice_control,
             )
         )
+    elif kind == protocol.SET_MODEL:
+        # Two independent things in one frame: which keyword *this* connection uses,
+        # and what the keywords mean for the whole install. The map is applied first
+        # so a single frame can invent a keyword and immediately select it.
+        if settings.feature_model_control:
+            if "map" in payload:
+                # A SQLite write; off the event loop, like every other DB touch here.
+                changed = await asyncio.to_thread(models.apply_map, payload["map"], settings)
+                if changed:
+                    logger.info("[%s] Re-pointed keyword(s): %s", session.id, changed)
+                    # Already in effect locally; this only tells the rest of the
+                    # ecosystem. Fire-and-forget so a slow store can't stall the ack.
+                    model_sync.schedule(settings)
+            if "keyword" in payload:
+                session.model_keyword = _chosen_keyword(payload["keyword"])
+                logger.info(
+                    "[%s] Model set: %s",
+                    session.id,
+                    session.model_keyword or "(server default)",
+                )
+        else:
+            logger.debug("[%s] Ignoring set_model (model control disabled)", session.id)
+        await send_json(_model_frame(session, settings))
     elif kind == protocol.TOOL_RESULT:
         # A result for a client-side tool call the brain is awaiting.
         session.client_tools.resolve(
@@ -355,6 +401,24 @@ async def _handle_control(
         )
     else:
         logger.debug("[%s] Ignoring unknown control frame: %r", session.id, payload)
+
+
+def _chosen_keyword(value) -> str | None:
+    """A ``set_model`` keyword, or ``None`` for "use the server's default".
+
+    ``None`` on the wire is the deliberate reset — the same meaning it carries in a
+    ``set_voice`` patch — and so is any value that isn't a usable keyword or model id.
+    Dropping a bad value silently matches every other control frame; the ``model``
+    frame that follows says what actually took effect, so nothing is left guessing.
+    """
+    if not isinstance(value, str):
+        return None
+    value = value.strip()
+    if not value:
+        return None
+    if "/" in value:
+        return value if models.valid_model(value) else None
+    return value.lower() if models.valid_keyword(value) else None
 
 
 async def _guarded_turn(
@@ -384,6 +448,9 @@ async def _guarded_turn(
             # Read here rather than at frame-parse time so a ``set_voice`` that lands
             # while this turn is speaking applies to the next one, not to sentence 4.
             voice=session.voice,
+            # Same discipline for the brain: switching model mid-reply would answer
+            # the second half of a question with a different model than the first.
+            model=session.model_keyword,
         )
     except asyncio.CancelledError:
         raise  # interrupt/barge-in — expected, let it unwind

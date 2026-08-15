@@ -69,6 +69,7 @@ async def run_turn(
     conversation_id: str | None = None,
     text: str | None = None,
     voice: VoiceSettings | None = None,
+    model: str | None = None,
 ) -> int:
     """Process one user turn and stream the spoken reply back.
 
@@ -88,6 +89,9 @@ async def run_turn(
     default is used. It is read once here and threaded down, so a ``set_voice``
     landing mid-reply takes effect on the next turn rather than switching voices
     between two sentences of the same one.
+
+    ``model`` is this connection's chosen model keyword (`app.models`), pinned for the
+    turn for the same reason and omitted to use the install's own.
 
     Returns the number of sentences spoken. Raises on transport/API failure so the
     caller can emit an error frame; ``asyncio.CancelledError`` from an interrupt is
@@ -132,6 +136,7 @@ async def run_turn(
                 client_tools,
                 conversation_id=conversation_id,
                 voice=voice,
+                model=model,
                 # A typed turn reads on a screen; a spoken one is heard. Same words,
                 # different register — see `app.persona`.
                 modality="text" if text is not None else "voice",
@@ -189,6 +194,7 @@ async def _think_and_speak(
     conversation_id: str | None = None,
     modality: str = "voice",
     voice: VoiceSettings | None = None,
+    model: str | None = None,
 ) -> tuple[int, str, bool, list[int]]:
     """Record the user turn, stream a reply, and record what was spoken.
 
@@ -239,6 +245,7 @@ async def _think_and_speak(
             client_tools=client_tools,
             signals=signals,
             conversation_id=conversation_id,
+            model=model,
         )
     else:
         tokens = respond(transcript_text)
