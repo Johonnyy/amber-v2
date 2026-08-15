@@ -29,7 +29,7 @@ def fake_io(monkeypatch):
     async def fake_transcribe(audio, **kw):
         return "I have a dog named Mango"
 
-    async def fake_synthesize(text):
+    async def fake_synthesize(text, voice=None):
         return f"AUDIO[{text}]".encode()
 
     monkeypatch.setattr(pipeline, "transcribe", fake_transcribe)

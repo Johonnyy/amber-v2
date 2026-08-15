@@ -56,9 +56,26 @@ class Settings(BaseSettings):
 
     # --- Models (swappable) ---
     stt_model: str = "whisper-1"
+    # The default voice. Every field here is the *install default* — a client may
+    # override any of them for its own connection with a ``set_voice`` frame (see
+    # `app.voice`), which is what lets a desktop app expose them as UI instead of
+    # requiring an edit on the box and a restart.
+    #
+    # ``tts-1`` is the low-latency model and the one ``tts_speed`` acts on directly.
+    # ``gpt-4o-mini-tts`` sounds considerably better and takes prose direction via
+    # ``tts_instructions``, but ignores ``speed`` — `app.voice` translates a speed
+    # into a pacing instruction there so the knob means one thing on both.
     tts_model: str = "tts-1"
     tts_voice: str = "alloy"
     tts_format: str = "mp3"
+    # Speaking rate, 0.25–4.0. The endpoint's own default is 1.0, which is a
+    # measured, audiobook pace — fine for narration and noticeably slow for
+    # conversation, where the listener already has the context. 1.15 is the mild
+    # correction; set it back to 1.0 for the API's own behaviour.
+    tts_speed: float = 1.15
+    # Free-text direction for the voice ("warm, brisk, dry"). Only ``gpt-4o-mini-tts``
+    # acts on it; it is not sent to the older models, which reject it.
+    tts_instructions: str = ""
     # The brain, as a **named tier** rather than a model id. agent_runtime's
     # model_router resolves "balanced" -> a concrete model, so upgrading every app
     # in the ecosystem is one edit in the router rather than one per app. Today
@@ -222,6 +239,12 @@ class Settings(BaseSettings):
     # and never calls back to the client. Independent of ``feature_tools`` (which
     # governs Amber's own server-side tools).
     feature_client_tools: bool = True
+    # When false, ``set_voice`` frames are ignored and every connection speaks with
+    # the ``tts_*`` settings above. The override is per-connection and can only pick
+    # values from `app.voice`'s catalogue, so this is a preference (pin the voice for
+    # every client) rather than a security boundary. The ``voice`` frame is still
+    # sent either way, so a client can show what it is getting.
+    feature_voice_control: bool = True
     # Turn-based conversations: when true, the brain offers the ``expect_reply``
     # signaling tool so Amber can deliberately hold a turn open for the user's
     # answer (``turn_complete`` then carries ``awaiting_response``). When false the

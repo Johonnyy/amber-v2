@@ -48,6 +48,19 @@ the same way. Everything downstream is identical: the server still echoes a
 still speaks the reply. Only the STT step is skipped. Clients that only send audio
 are unaffected.
 
+Voice control adds one *additive* frame in each direction, so a client can choose
+how Amber sounds without an edit and a restart on the server:
+  * ``set_voice`` (client -> server) — a **patch** over this connection's voice
+    settings: any of ``voice``, ``model``, ``format``, ``speed``, ``instructions``.
+    Absent keys are unchanged and unrecognised values are dropped silently; an
+    explicit ``null`` resets that one field to the server's configured default.
+  * ``voice`` (server -> client) — what is actually in effect, plus the catalogue
+    of what this Amber accepts (so a picker needn't hardcode it). Sent once right
+    after ``ready``, and again after every ``set_voice``. It is the acknowledgment:
+    values are validated and clamped server-side, so this frame — never the patch —
+    is the truth about what the next sentence will sound like.
+A client that sends neither gets the install's configured voice, exactly as before.
+
 Turn-based conversations extend ``turn_complete`` *additively* with an optional
 ``awaiting_response`` field: ``True`` when Amber asked something it expects the user
 to answer, so the client should keep the mic open and send the next utterance as a
@@ -64,6 +77,7 @@ INTERRUPT = "interrupt"  # stop speaking mid-response
 USER_TEXT = "user_text"  # a typed utterance, taken verbatim instead of transcribed
 REGISTER_TOOLS = "register_tools"  # client declares tools Amber may call on it
 TOOL_RESULT = "tool_result"  # the result of a client-side tool call (see TOOL_CALL)
+SET_VOICE = "set_voice"  # patch how Amber sounds on this connection
 
 # --- server -> client message types ---
 READY = "ready"  # handshake accepted; server is listening
@@ -73,6 +87,7 @@ AUDIO_CHUNK = "audio_chunk"  # metadata; the NEXT binary frame is this sentence
 TURN_COMPLETE = "turn_complete"  # the full response has been sent
 MEMORY = "memory"  # what Amber currently remembers about the user (advisory)
 TOOL_CALL = "tool_call"  # asks the client to run one of its declared tools
+VOICE = "voice"  # the voice settings in effect, and what this Amber accepts
 ERROR = "error"  # something went wrong this turn
 
 # --- error codes (the optional ``code`` field on an error frame) ---
@@ -169,6 +184,31 @@ def tool_call(call_id: str, name: str, tool_input: dict[str, Any]) -> dict[str, 
         "name": name,
         "input": tool_input,
     }
+
+
+def voice(
+    settings: dict[str, Any],
+    options: dict[str, Any] | None = None,
+    *,
+    locked: bool = False,
+) -> dict[str, Any]:
+    """The voice settings in effect on this connection.
+
+    ``settings`` is `app.voice.VoiceSettings.as_dict()` — the *effective* values
+    after validation and clamping, which is why this frame rather than the client's
+    own ``set_voice`` payload is the truth. ``options`` is the catalogue this Amber
+    accepts (voices, models, containers, the speed range), so a client can build a
+    picker from it instead of shipping a copy that drifts. ``locked`` is ``True``
+    when ``AMBER_FEATURE_VOICE_CONTROL`` is off and ``set_voice`` is being ignored —
+    a client should show the settings as read-only rather than let a user change
+    something that will silently snap back.
+    """
+    frame: dict[str, Any] = {"type": VOICE, "settings": dict(settings)}
+    if options is not None:
+        frame["options"] = dict(options)
+    if locked:
+        frame["locked"] = True
+    return frame
 
 
 def error(message: str, code: str | None = None) -> dict[str, Any]:

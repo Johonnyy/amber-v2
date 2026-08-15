@@ -32,6 +32,7 @@ from functools import lru_cache
 from app.client_tools import ClientTools
 from app.config import get_settings
 from app.ratelimit import RateLimiter
+from app.voice import VoiceSettings
 
 
 @dataclass
@@ -79,6 +80,12 @@ class Session:
     # Tools this client declared it can run on its own device (see
     # app.client_tools). Persists across reconnect until the client re-declares.
     client_tools: ClientTools = field(default_factory=ClientTools)
+    # How Amber sounds to *this* client (see app.voice). Starts at the install
+    # default and is replaced wholesale by a ``set_voice`` patch. Retained across a
+    # reconnect like the tools above, so resuming a session doesn't reset the voice
+    # mid-conversation; the ``voice`` frame on the next ``ready`` tells the client
+    # what it resumed with.
+    voice: VoiceSettings = field(default_factory=VoiceSettings.from_settings)
 
 
 class SessionManager:

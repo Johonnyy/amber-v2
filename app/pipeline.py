@@ -42,6 +42,7 @@ from app.session import Conversation
 from app.stt import transcribe
 from app.tts import synthesize
 from app.turn_signals import TurnSignals
+from app.voice import VoiceSettings
 
 if TYPE_CHECKING:
     from app.client_tools import ClientTools
@@ -67,6 +68,7 @@ async def run_turn(
     *,
     conversation_id: str | None = None,
     text: str | None = None,
+    voice: VoiceSettings | None = None,
 ) -> int:
     """Process one user turn and stream the spoken reply back.
 
@@ -82,12 +84,19 @@ async def run_turn(
     is that STT is skipped. Everything from the ``transcript`` frame onward is the
     same path a spoken turn takes.
 
+    ``voice`` is this connection's TTS settings (`app.voice`); omitted, the install
+    default is used. It is read once here and threaded down, so a ``set_voice``
+    landing mid-reply takes effect on the next turn rather than switching voices
+    between two sentences of the same one.
+
     Returns the number of sentences spoken. Raises on transport/API failure so the
     caller can emit an error frame; ``asyncio.CancelledError`` from an interrupt is
     allowed to propagate untouched.
     """
     settings = get_settings()
     conversation = conversation if conversation is not None else Conversation()
+    # Pinned for the whole turn — see the docstring.
+    voice = voice if voice is not None else VoiceSettings.from_settings(settings)
 
     # 1. Transcribe — or take the client's typed text verbatim, skipping STT.
     if text is not None:
@@ -111,7 +120,9 @@ async def run_turn(
         if not transcript_text:
             # Nothing heard (silence, or STT disabled) — reprompt without spending
             # an LLM call or feeding the brain an empty user turn.
-            spoken = await _speak_stream(_canned(_DIDNT_CATCH), send_json, send_bytes)
+            spoken = await _speak_stream(
+                _canned(_DIDNT_CATCH), send_json, send_bytes, voice
+            )
         else:
             spoken, reply, awaiting, used_fact_ids = await _think_and_speak(
                 transcript_text,
@@ -120,6 +131,7 @@ async def run_turn(
                 send_bytes,
                 client_tools,
                 conversation_id=conversation_id,
+                voice=voice,
                 # A typed turn reads on a screen; a spoken one is heard. Same words,
                 # different register — see `app.persona`.
                 modality="text" if text is not None else "voice",
@@ -176,6 +188,7 @@ async def _think_and_speak(
     *,
     conversation_id: str | None = None,
     modality: str = "voice",
+    voice: VoiceSettings | None = None,
 ) -> tuple[int, str, bool, list[int]]:
     """Record the user turn, stream a reply, and record what was spoken.
 
@@ -234,7 +247,7 @@ async def _think_and_speak(
     spoken = 0
     try:
         spoken = await _speak_stream(
-            _capture(tokens, spoken_text), send_json, send_bytes
+            _capture(tokens, spoken_text), send_json, send_bytes, voice
         )
     finally:
         reply = "".join(spoken_text).strip()
@@ -289,16 +302,19 @@ async def _speak_stream(
     tokens: AsyncIterator[str],
     send_json: SendJson,
     send_bytes: SendBytes,
+    voice: VoiceSettings | None = None,
 ) -> int:
     """Run a token stream through the splitter, synthesizing & sending each sentence."""
-    settings = get_settings()
+    voice = voice if voice is not None else VoiceSettings.from_settings()
     splitter = SentenceSplitter()
     index = 0
 
     async def emit(sentence: str) -> None:
         nonlocal index
-        audio_bytes = await synthesize(sentence)
-        await send_json(protocol.audio_chunk(index, sentence, settings.tts_format))
+        audio_bytes = await synthesize(sentence, voice)
+        # The container comes from the voice actually used, not from config — a
+        # client that asked for wav must not be told the bytes are mp3.
+        await send_json(protocol.audio_chunk(index, sentence, voice.audio_format))
         await send_bytes(audio_bytes)
         index += 1
 

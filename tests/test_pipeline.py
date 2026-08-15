@@ -31,7 +31,7 @@ def fake_io(monkeypatch):
     async def fake_transcribe(audio, **kw):
         return "hello amber"
 
-    async def fake_synthesize(text):
+    async def fake_synthesize(text, voice=None):
         return f"AUDIO[{text}]".encode()
 
     async def no_context(query=None, **kw):

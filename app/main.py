@@ -35,6 +35,7 @@ from app import protocol, signals
 from app.config import Settings, get_settings
 from app.pipeline import run_turn
 from app.session import Session, SessionManager, get_session_manager
+from app.voice import options as voice_options
 
 settings = get_settings()
 logging.basicConfig(
@@ -144,6 +145,16 @@ async def voice_socket(websocket: WebSocket) -> None:
     requested = websocket.query_params.get("session_id") or None
     session, resumed = manager.resume_or_create(requested)
     await websocket.send_json(protocol.ready(session.id, resumed))
+    # Right after ready, so a client knows how Amber currently sounds and what it may
+    # ask for without hardcoding the catalogue. Purely additive — a client that
+    # doesn't know the frame ignores it.
+    await websocket.send_json(
+        protocol.voice(
+            session.voice.as_dict(),
+            voice_options(),
+            locked=not settings.feature_voice_control,
+        )
+    )
     logger.info(
         "[%s] Client %s (%d turn(s) of history)",
         session.id,
@@ -319,6 +330,22 @@ async def _handle_control(
     elif kind == protocol.REGISTER_TOOLS:
         names = session.client_tools.register(payload.get("tools"))
         logger.info("[%s] Client registered %d tool(s): %s", session.id, len(names), names)
+    elif kind == protocol.SET_VOICE:
+        # A patch over this connection's voice. Validated and clamped in
+        # `app.voice`; the ack below reports what actually took effect, so a client
+        # never has to guess whether its value survived.
+        if settings.feature_voice_control:
+            session.voice = session.voice.patched(payload)
+            logger.info("[%s] Voice set: %s", session.id, session.voice.as_dict())
+        else:
+            logger.debug("[%s] Ignoring set_voice (voice control disabled)", session.id)
+        await send_json(
+            protocol.voice(
+                session.voice.as_dict(),
+                voice_options(),
+                locked=not settings.feature_voice_control,
+            )
+        )
     elif kind == protocol.TOOL_RESULT:
         # A result for a client-side tool call the brain is awaiting.
         session.client_tools.resolve(
@@ -354,6 +381,9 @@ async def _guarded_turn(
             # exchange.
             conversation_id=session.id,
             text=text,
+            # Read here rather than at frame-parse time so a ``set_voice`` that lands
+            # while this turn is speaking applies to the next one, not to sentence 4.
+            voice=session.voice,
         )
     except asyncio.CancelledError:
         raise  # interrupt/barge-in — expected, let it unwind

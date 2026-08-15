@@ -182,6 +182,29 @@ wrapper around it:
 Treat this protocol as a stable public contract. Changing message shapes breaks every
 client; additive changes only.
 
+**Voice settings are per-connection.** TTS used to read `settings.tts_*` at synthesis
+time, which made the voice a process-wide constant — changing it meant editing `.env`
+on the box and restarting, and every client got the same one. `app/voice.py` makes it
+a value (`VoiceSettings`: model, voice, container, speed, instructions) that lives on
+the `Session`, defaults from config, and is patched over the wire by `set_voice`. The
+server answers with a `voice` frame carrying the *effective* settings — validated,
+clamped, and reset-capable — plus the catalogue of what this Amber accepts, so a
+client builds its picker from the wire rather than shipping a list that drifts. An
+explicit `null` in a patch means "back to the server's default", which is what makes
+"use Amber's own setting" a state a UI can return to rather than only leave. The
+frame is read once per turn in `run_turn`, so a change mid-reply lands on the next
+turn instead of switching voices between two sentences. Gated by
+`AMBER_FEATURE_VOICE_CONTROL` (on); off pins every connection to the config and marks
+the `voice` frame `locked` so a client shows the values read-only instead of letting
+them silently snap back.
+
+The one real subtlety is that OpenAI's two TTS generations take opposite parameters:
+`tts-1`/`tts-1-hd` accept `speed` and reject `instructions`, while `gpt-4o-mini-tts`
+is the reverse and ignores `speed` entirely. `speech_params` resolves that in one
+place — on a model that ignores speed, a non-default speed becomes a pacing sentence
+prepended to the instructions, so the knob means one thing on both rather than
+silently doing nothing on the better-sounding model.
+
 **Typed turns.** `user_text` (`{"type": "user_text", "text": "..."}`) is the exact peer
 of a binary utterance: it takes a turn slot, obeys the same rate limit and session cap,
 and barges in on an in-flight turn identically. The *only* difference is that STT is
@@ -502,7 +525,7 @@ All three changes landed, and the voice loop and WS protocol are untouched:
 * **`conversation_id` is the session id**, threaded from `main.py` through
   `run_turn` into the brain, so model spend and tool calls are attributable to a
   session and any peer call joins the same exchange.
-* **`X-Confirmed` still has no source.** `app/protocol.py` has 7 server frame types
+* **`X-Confirmed` still has no source.** `app/protocol.py` has 8 server frame types
   and no tool-event frame, so a human cannot approve anything yet. Amber's MCP tools
   are therefore *not* marked `requires_confirmation`: the two mutating ones are
   trivially reversible, and marking them would make them permanently uncallable
@@ -518,7 +541,7 @@ All three changes landed, and the voice loop and WS protocol are untouched:
   overhaul (tiered self-curating memory with migrations and FTS retrieval, a
   composed modality-aware prompt, memory-management tools, `auto` search +
   `read_url`, telemetry, and the unattended maintenance pass). Voice pipeline
-  complete, streaming seam intact, 353 tests in `tests/`. Runs on `agent-runtime`
+  complete, streaming seam intact, 377 tests in `tests/`. Runs on `agent-runtime`
   and serves her own MCP server.
   - **Not yet done here:** reminders still can't *fire* — they're recorded,
     listable and completable, but delivery needs a server-initiated protocol frame.

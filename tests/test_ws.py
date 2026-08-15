@@ -20,7 +20,7 @@ def faked_io(monkeypatch):
     async def fake_transcribe(audio, **kw):
         return "hello amber"
 
-    async def fake_synthesize(text):
+    async def fake_synthesize(text, voice=None):
         return f"AUDIO[{text}]".encode()
 
     async def fake_think(messages, system=None, **kwargs):
@@ -53,8 +53,15 @@ def fresh_caches():
 
 
 def _read_ready(ws) -> dict:
+    """Consume the handshake — ``ready`` plus the ``voice`` frame that follows it.
+
+    Both are sent unconditionally before anything else, so swallowing the pair here
+    keeps every test's first ``receive_json`` the frame it actually cares about.
+    """
     frame = ws.receive_json()
     assert frame["type"] == protocol.READY
+    voice = ws.receive_json()
+    assert voice["type"] == protocol.VOICE
     return frame
 
 
@@ -95,7 +102,7 @@ def test_awaiting_response_reaches_the_wire(fresh_caches, monkeypatch):
     async def fake_transcribe(audio, **kw):
         return "play it"
 
-    async def fake_synthesize(text):
+    async def fake_synthesize(text, voice=None):
         return f"AUDIO[{text}]".encode()
 
     async def signaling_think(messages, system=None, signals=None, **kwargs):
