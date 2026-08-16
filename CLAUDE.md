@@ -498,8 +498,22 @@ Inline tools: `search.py` (`web_search`), `fetch.py` (`read_url`), `tasks.py`,
 `remember_fact`, `correct_fact`, `forget_fact`, `list_reminders`,
 `complete_reminder` — gated by `feature_memory`), `recall.py` (`recall_recent`, now
 searchable) and `update.py` (`update_server`, only when `AMBER_UPDATE_COMMAND` is
-set). Heavier or delegated work goes to a **peer MCP server** listed in
-`AMBER_MCP_PEERS`.
+set). Heavier or delegated work goes to a **peer MCP server** — from `AMBER_MCP_PEERS`
+*and* from whatever has registered with the sync store, unioned by
+`agent_mcp.PeerRegistry` ([app/peers.py](app/peers.py)) with the static map winning.
+
+That union is new, and the bug it closes is worth remembering because it had **no
+symptom at all**. `build_broker` read only the static map, and passed that same dict
+as `MCPClient`'s `resolver` — which returns from its `Mapping` branch before it could
+ever consult `agent_mcp.registry`. So an empty `AMBER_MCP_PEERS` built no MCP client
+whatsoever, and Bloom could register perfectly, appear in `GET /servers`, mount its
+MCP server and answer 401 to an unauthenticated probe while Amber named her own
+thirteen tools and no `bloom__*` ones. Nothing logged anything, on either side: an
+unlisted peer is not a tool that fails, it is no tool. The store had always held a
+credential per server and `PeerRegistry` had always kept a two-layer cache; neither
+was reachable from here. `AMBER_FEATURE_PEER_DISCOVERY` (on) is the switch, and off
+pins her to the static map — which is what you want when a bad registry entry is
+sending her somewhere she should not go, since static wins anyway.
 
 **Amber curates her own memory.** The memory tools exist because memory used to
 happen *to* her: she could not search, commit, correct or forget a fact, so "no, I
@@ -676,8 +690,9 @@ All three changes landed, and the voice loop and WS protocol are untouched:
   `read_url`, telemetry, and the unattended maintenance pass), plus per-connection
   voice and model control with a keyword table shared through the sync store, and
   ecosystem self-knowledge in the prompt. Voice pipeline complete, streaming seam
-  intact, 453 tests in `tests/`. Runs on `agent-runtime` and serves her own MCP
-  server.
+  intact, 473 tests in `tests/`. Runs on `agent-runtime` and serves her own MCP
+  server, and resolves peers through the registry as well as the env map
+  ([app/peers.py](app/peers.py)).
   - **Not yet done here:** reminders still can't *fire* — they're recorded,
     listable and completable, but delivery needs a server-initiated protocol frame.
     The maintenance scheduler makes that a small follow-on. Long-term memory as
@@ -711,8 +726,15 @@ All three changes landed, and the voice loop and WS protocol are untouched:
 - **notification-relay**: not yet built.
 - **Hosted sync store**: **built**, in `amber-infra/sync-store` — the server registry,
   Aperture's config blobs, and (new) the shared model-keyword table at `/models`.
-  `AMBER_MCP_PEERS` remains the designed fallback when no store is configured, not a
-  workaround.
+  `/servers` is now actually *used* for discovery: Amber unions the store's peer list
+  over `AMBER_MCP_PEERS` rather than reading only the env map, so registering an app
+  makes it callable instead of merely visible. `AMBER_MCP_PEERS` stays the designed
+  override — static beats discovered — and the whole fallback when no store is
+  configured, not a workaround.
+  Wiring a pair is `amber-infra/install/connect-peer.sh` (one button in Aperture's
+  Servers tab), which reads the pairing out of both manifests, mints or reuses the
+  bearer on the box, and publishes it to the store — so the two ends cannot be filled
+  in with values that disagree.
 - **amber-infra**: built out around the sync store (Caddy, install, deploy, backups).
   **amber-template**: specced, not yet built.
 - **All individual app agents (finance, school, etc.)**: not yet started.
@@ -736,8 +758,9 @@ All three changes landed, and the voice loop and WS protocol are untouched:
 3. ~~Amber refactor~~ — done (OpenClaw out, brain on `agent-runtime`, own MCP server)
 4. ~~Hosted config sync store~~ — done, as `amber-infra/sync-store`: `/servers`
    (registration + discovery), `/models` (the shared keyword table) and `/config`.
-   Peers still fall back to the static `AMBER_MCP_PEERS` map when no store is
-   configured.
+   Peers resolve through `/servers` first-class now (`app/peers.py`), falling back to
+   the static `AMBER_MCP_PEERS` map when no store is configured — and preferring it
+   when both have an answer.
 5. **Aperture** — promoted out of last place. It's under way, and the design
    principles make it the surface every later item is consumed through, so it stops
    being the thing that waits until the backends are done. Its first job list: Amber
