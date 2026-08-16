@@ -38,12 +38,11 @@ from functools import lru_cache
 
 from agent_mcp import AgentMCPServer, AgentMCPSettings
 
-from app.config import Settings, get_settings
+from app.config import APP_NAME, Settings, get_settings
 from app.memory.store import get_store
 from app.tools import run_tool
 
 logger = logging.getLogger(__name__)
-
 
 def mcp_settings(settings: Settings | None = None) -> AgentMCPSettings:
     """Build `agent_mcp`'s settings from Amber's own.
@@ -54,7 +53,7 @@ def mcp_settings(settings: Settings | None = None) -> AgentMCPSettings:
     settings = settings or get_settings()
     return AgentMCPSettings(
         _env_file=None,
-        app_name="amber",
+        app_name=APP_NAME,
         version="0.1.0",
         keys=settings.mcp_keys,
         allow_anonymous=False,
@@ -78,7 +77,7 @@ def build_server(settings: Settings | None = None) -> AgentMCPServer:
     """
     settings = settings or get_settings()
     mcp = AgentMCPServer(
-        app_name="amber",
+        app_name=APP_NAME,
         version="0.1.0",
         settings=mcp_settings(settings),
         instructions=(

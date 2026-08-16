@@ -23,6 +23,20 @@ from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
+#: What this app calls itself to the rest of the ecosystem.
+#:
+#: Not a setting — it is the name Amber registers under, the prefix on the tools she
+#: exposes to peers, and therefore the one name she must never resolve as a peer
+#: *herself*: ``GET /servers`` returns her own registration, so an install that
+#: discovers anything also discovers itself unless it knows its own name.
+#:
+#: Here rather than in `app.mcp_server` because `app.peers` needs it and sits on the
+#: prompt path — importing the MCP server from there would drag `app.tools` and the
+#: memory store in behind it, to learn a five-letter string. Config is the one module
+#: both already import, and it imports nothing of Amber's.
+APP_NAME = "amber"
+
+
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
         env_prefix="AMBER_",

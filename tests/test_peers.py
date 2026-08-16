@@ -315,3 +315,64 @@ async def test_the_loop_pulls_immediately(store):
 async def test_the_loop_returns_at_once_when_disabled(store):
     await asyncio.wait_for(peers.refresh_loop(_settings(mcp_sync_store_url="")), timeout=1)
     assert store.calls == []
+
+
+# --- Amber is not her own peer ----------------------------------------------
+#
+# The symmetric half of the outage this file was written for. That fix wired
+# discovery to the sync store; the store's `GET /servers` returns every registered
+# server, and Amber is one of them — she registered herself. So the turn discovery
+# started working, she also acquired `amber__search_memory`, `amber__list_tasks`,
+# `amber__add_task` and `amber__complete_task`: namespaced HTTP duplicates of tools
+# she already runs in-process, reachable only by leaving the process and coming back
+# to it. That is precisely the invariant `AnthropicRegistryBroker` exists to hold —
+# "so Amber never makes an HTTP call to herself to add a task".
+#
+# Nothing errored. The depth guard even bounds the loop. The only visible symptom was
+# Amber answering "I can hand work off to the Amber or Bloom agents".
+
+
+def test_her_own_registration_is_not_a_peer(store):
+    reg = default_registry()
+    reg._discovered = {
+        "amber": PeerRecord("amber", "https://amber.test"),
+        "bloom": PeerRecord("bloom", "https://bloom.test"),
+    }
+    assert peers.known_peers(_settings()) == ["bloom"]
+    assert reg.resolve("amber") is None
+    # The real peer beside her is untouched — the exclusion is one name, not a mode.
+    assert reg.resolve("bloom").base_url == "https://bloom.test"
+
+
+def test_a_static_map_naming_herself_is_refused_too(store):
+    """A hand-written AMBER_MCP_PEERS, or connect-peer pointed at the wrong end.
+
+    Static beats discovered everywhere else in this module, and deliberately so. It
+    does not beat this: there is no incident during which the answer is "call
+    yourself over HTTP", and the in-process path always exists.
+    """
+    names = peers.known_peers(
+        _settings(mcp_peers="amber=https://amber.test,bloom=https://bloom.test")
+    )
+    assert names == ["bloom"]
+    assert default_registry().resolve("amber") is None
+
+
+def test_the_prompt_and_the_broker_agree_that_she_is_not_a_peer(store):
+    """The two readers of `known_peers`, checked against each other.
+
+    They disagreeing is its own outage — it is what made her claim she could hand
+    work to Bloom while holding no tool for it — so a change to one that misses the
+    other has to fail here.
+    """
+    from app import ecosystem
+
+    reg = default_registry()
+    reg._discovered = {"amber": PeerRecord("amber", "https://amber.test")}
+    settings = _settings()
+
+    block = ecosystem.build_ecosystem_block(settings)
+    assert "Amber agent" not in block
+    # With herself excluded there is nothing left, so the honest negative stands.
+    assert "No other agents are reachable" in block
+    assert peers.known_peers(settings) == []

@@ -57,7 +57,7 @@ from typing import Any
 
 from agent_mcp.registry import PeerRegistry, default_registry, load_static_peers
 
-from app.config import Settings, get_settings
+from app.config import APP_NAME, Settings, get_settings
 
 logger = logging.getLogger(__name__)
 
@@ -102,9 +102,25 @@ def known_peers(settings: Settings | None = None) -> list[str]:
     copy, no I/O, and it has to happen somewhere every turn so that removing a peer
     from ``AMBER_MCP_PEERS`` does not leave it resolving for the life of the process.
     Doing it here means it happens whether the prompt or the broker is built first.
+
+    **Amber is not her own peer.** She registers with the sync store, so ``GET
+    /servers`` hands her own record straight back and she loaded it like any other —
+    acquiring ``amber__add_task`` beside the in-process ``add_task``, a duplicate
+    reachable only by going out to the network and back to the same process. That is
+    the invariant `AnthropicRegistryBroker` exists to hold ("Amber never makes an
+    HTTP call to herself to add a task"), and discovery quietly broke it the moment
+    it started working. The only symptom was her offering to hand work off to "the
+    Amber agent".
+
+    `AgentMCPServer` sets this itself, so every app on the library is covered without
+    asking — but only if it builds a server, and Amber's needs ``AMBER_MCP_KEYS`` to
+    mount at all. Asserting it here too costs a string compare and covers the install
+    that has discovery on and its own server off, where a registration written by an
+    earlier run can outlive the process that wrote it.
     """
     settings = settings or get_settings()
     reg = registry()
+    reg.set_self_name(APP_NAME)
     reg.set_static(load_static_peers(settings.mcp_peers, settings.mcp_peer_token))
     return reg.known()
 
