@@ -6,8 +6,10 @@ a repo-specific CLAUDE.md when working inside an individual app; this version is
 canonical, ecosystem-wide reference.
 
 It also documents **this** repo (`amber`) in detail — see [This repo:
-Amber](#this-repo-amber) near the bottom. Amber is built and working; the ecosystem
-around her is mostly not built yet. Keep the two clearly separated when reading.
+Amber](#this-repo-amber) near the bottom. Amber, the two shared libraries, the sync
+store and (in progress) Aperture exist; the individual domain apps do not yet. Keep
+"designed" and "built" clearly separated when reading — the Current state section is
+the authority on which is which.
 
 ## What this is
 
@@ -16,7 +18,8 @@ tracking, FreeCallMe's dashboard, etc.), each usable completely standalone, that
 expose themselves to a personal AI layer via MCP. **Amber** is the orchestrating
 voice/text agent that knows Johnny and can query or act across every connected app.
 **Aperture** is the unifying Electron shell that ties the apps together visually and
-manages device config/sync. Every app can be cloned and run alone by anyone — the
+manages device config/sync — and since new apps ship backend-only, it is *the* place
+their data is seen and operated. Every app can be cloned and run alone by anyone — the
 agent layer is always an opt-in extension, never a dependency.
 
 ## Core principle (do not violate)
@@ -25,6 +28,41 @@ agent layer is always an opt-in extension, never a dependency.
 clone`-ing a single app and running it requires anything from another repo, that's a
 bug in the design. The agent/MCP layer is always optional, toggled by a feature flag,
 off by default.
+
+## Design principles (treat these as binding)
+
+These four decide *how* a feature is built, the way the principle above decides *what
+it may depend on*. They apply to every new app and every new Aperture feature.
+
+**1. Aperture is visual first.** Reach for a visual representation before text. If the
+data has a shape — time, quantity, hierarchy, geography, state, relationship — render
+that shape: a chart, a timeline, a map, a graph, a status board, a diff view. A table
+beats a paragraph; a chart beats a table when the point is a trend. Text is what you
+fall back to when nothing visual would carry the information, not the default a visual
+has to argue its way past. The reason a shell over a pile of backends is worth building
+at all is that a screen shows at a glance what a transcript makes you read.
+
+**2. If it can't be done in the UI, it isn't done.** Every configuration, fix, and
+recovery path must exist in Aperture. Editing a `.env` on the box, running a migration
+by hand, `systemctl restart`, poking SQLite — each of those needs a UI equivalent
+before the feature counts as shipped. Dropping to a terminal to make something work is
+a bug in Aperture, not a documentation gap; the whole purpose is defeated the moment
+SSH becomes load-bearing.
+
+**3. Amber is the brain — everything is reachable in natural language.** Aperture does
+not grow a second intelligence layer. Anything the UI can do, Amber can do when asked,
+driving the *same* underlying setting or action the UI writes — never a parallel path.
+Adding a feature means adding the tool (or protocol frame) that lets Amber drive it, in
+the same change, not as a follow-on. The canonical case: **"can you talk slower?" lowers
+the TTS speed in settings**, and the Settings page shows the new value. A feature only a
+click can reach is half-built; so is one only Amber can reach.
+
+**4. New apps are backend-only for now.** A new app ships its API and its MCP server;
+its own dashboard is **deferred**. Aperture is where its data becomes visible and Amber
+is where it becomes conversational, so a per-app frontend is duplicated work until the
+app earns one. This does not weaken the standalone principle — the app still runs alone
+and is still fully usable through its own API. Next.js remains the default *when* a
+frontend is finally warranted.
 
 ## The reframe that resolved most early confusion
 
@@ -40,10 +78,10 @@ the loop logic.
 | Name | What it is |
 |---|---|
 | **Amber** | Personal orchestrating agent — voice pipeline, memory, backend-only, no frontend |
-| **Aperture** | Electron shell app — unifying UI, device-local config store, import/export/sync |
-| **agent-spawner** | Service wrapping `agent-runtime` — decides model tier, routes tasks, tracks cost centrally |
+| **Aperture** | Electron shell app — the visual-first UI for the whole ecosystem, device-local config store, import/export/sync |
+| **agent-spawner** / **Bloom** | Service wrapping `agent-runtime` — where an agent is *defined* (prompt + model keyword + connections) rather than built, and where delegated tasks run. Built, as the `bloom` repo; "agent-spawner" is the design-time name these docs still use |
 | **notification-relay** | Push notification fan-out (Redis pub/sub → APNs → iOS) |
-| **finance-agent, school-agent, outpost, freecallme, etc.** | Individual domain apps, each with their own frontend + MCP server |
+| **finance-agent, school-agent, outpost, freecallme, etc.** | Individual domain apps — backend + MCP server; their own frontend is deferred, Aperture renders them |
 
 Naming style for future apps: single clean nouns, consistent with
 Outpost/ThinkTank/Aperture (Forge, Sentinel, Herald, Atlas, etc. — see naming
@@ -52,23 +90,26 @@ assigning).
 
 ## Repo list
 
-- `amber` — the agent itself (**this repo**; exists and works, needs refactor — see below)
+- `amber` — the agent itself (**this repo**; built, working, and refactored onto the
+  shared libraries — see below)
 - `agent-mcp-py` — shared library: wraps the MCP Python SDK with auth, depth-guard,
   usage logging, sync-store registration. Every Python app's MCP server is built on this.
 - `agent-runtime` — shared library: the actual agentic loop (call model → tool call →
   execute → repeat), built on OpenRouter's OpenAI-compatible endpoint. Imported
   directly (not called over network) by Amber and agent-spawner.
-- `agent-spawner` — service, imports `agent-runtime` in-process, exposes task
-  delegation as an MCP tool for apps that don't want to embed the runtime themselves.
+- `bloom` (the repo the docs call `agent-spawner`) — service, imports `agent-runtime`
+  in-process, exposes task delegation and agent creation as MCP tools plus a REST
+  admin API for Aperture.
 - `notification-relay` — service, Redis pub/sub, single `send_notification` endpoint
   (also exposed as an MCP tool).
 - `amber-infra` — deployment backbone: Caddy config, install script, backup scripts,
   CI templates, the hosted config sync store.
 - `amber-template` — scaffold repo, pre-wired with `agent-mcp-py`, Docker, CI,
   backups. `npx degit` starting point for every new app.
-- `Aperture` — Electron shell.
+- `Aperture` — Electron shell; the visual surface for everything, and the only place
+  the ecosystem is meant to be operated from.
 - Individual app repos (`finance-agent`, `outpost`, etc.) — each standalone, each
-  optionally MCP-enabled.
+  optionally MCP-enabled, each **backend-only for now** (see design principle 4).
 - `freecallme` — existing Next.js/Vercel/Supabase app, **not rewritten**; gets a small
   TypeScript MCP sidecar added.
 
@@ -76,12 +117,22 @@ assigning).
 
 - **New backend-heavy apps default to Python (FastAPI)** — this is what lets them
   share `agent-mcp-py` and `agent-runtime` with Amber and the spawner.
-- **Frontends default to Next.js (React)** for anything with a dashboard.
+- **New apps ship no frontend.** Per-app dashboards are deferred (design principle 4);
+  build the API + MCP server and let Aperture render it. When an app does eventually
+  earn its own frontend, the default is still Next.js (React).
 - **Existing apps are not rewritten to match the pattern.** FreeCallMe stays Next.js;
   it gets an MCP server written in TypeScript (`@modelcontextprotocol/sdk`) as a
   sidecar, not a port to Python. MCP is the interop layer specifically so language
-  doesn't have to match everywhere — only the protocol does.
-- **Aperture** is Electron + React, frontend-only, not itself an MCP server.
+  doesn't have to match everywhere — only the protocol does. Apps that already *have*
+  a frontend keep it; the deferral is about not building new ones.
+- **Aperture** is Electron + React, frontend-only, not itself an MCP server. It is a
+  **client** of every app's MCP server and of Amber's WS protocol — which is exactly
+  why per-app dashboards can be skipped: an app that exposes resources and tools is
+  already renderable, and already conversational.
+- **Visualisation is a first-class dependency in Aperture**, not an afterthought
+  bolted on when a screen looks bare. Picking the chart/graph/board library and the
+  shared design tokens is part of building the shell, because principle 1 makes them
+  load-bearing.
 - **Registry / service discovery** is not a static YAML file — it's a small hosted sync
   store (living alongside `notification-relay` or similar always-on service) that
   Aperture edits through a UI and every headless agent (Amber, spawner, apps) reads
@@ -91,12 +142,22 @@ assigning).
 
 ## Conventions every app must follow
 
-- **Resource URIs mirror real dashboard views.** If a screen shows data, there's a
-  matching MCP resource returning the same data (e.g. `finance://transactions/recent`).
-  No separate "agent-only" version of the data.
+- **Resource URIs mirror real views.** Every view Aperture renders has a matching MCP
+  resource returning the same data (e.g. `finance://transactions/recent`). With per-app
+  frontends deferred this reads in the other direction too: the resources an app exposes
+  *are* the views, and Aperture builds its screens from them. No separate "agent-only"
+  version of the data.
 - **Tools mirror real user actions.** If a human can click it, there's a tool that does
   the same thing, calling the same underlying function as the UI — not a parallel code
   path that can drift.
+- **Every feature ships UI-reachable and Amber-reachable, in the same change.** The two
+  are not separate milestones: a setting the Settings page can write must have a tool or
+  frame Amber can drive, both landing on the same underlying value. This is design
+  principles 2 and 3 stated as an acceptance criterion — a PR that adds a capability
+  reachable only one way isn't finished.
+- **Anything an operator would SSH for gets a UI path.** Restarts, config edits,
+  migrations, log reads, key rotation. If the runbook says "ssh in and…", that step is
+  a missing Aperture feature.
 - **Query tools are marked `read_only=True`.** Action tools that are risky get
   `requires_confirmation=True`, gated by an `X-Confirmed` header set only after
   explicit approval.
@@ -120,7 +181,7 @@ assigning).
 - Every tool call is logged (caller, latency, success, conversation_id) via
   `agent_mcp`'s usage logging.
 - Lightweight thumbs up/down feedback, tagged to conversation_id, surfaces through
-  Aperture once it exists.
+  Aperture (now under way — see Current state).
 - The model-tier routing table gets refined from real cost/quality data over time, not
   fixed upfront.
 - Small per-app eval sets (10-20 hand-written query → expected-tool-call cases) catch
@@ -168,8 +229,9 @@ client records audio → WS → Amber transcribes (Whisper/OpenAI STT)
 The client only records and plays. Audio streams back **sentence by sentence** — the
 sentence splitter sits between the LLM token stream and TTS so the first audio plays
 before the full response is generated. This streaming boundary is the
-performance-critical seam; keep it intact when modifying the pipeline. The pending
-`agent-runtime` swap changes only what produces the token stream, never this seam.
+performance-critical seam; keep it intact when modifying the pipeline. The
+`agent-runtime` swap (done) changed only what produces the token stream, never this
+seam — and nothing since should either.
 
 ### Client protocol (WebSocket)
 
@@ -236,6 +298,20 @@ down leaves a **tombstone** — a row with an empty model — because otherwise 
 pull would silently restore the override. With no `AMBER_MCP_SYNC_STORE_URL` the
 whole module is inert and the table is simply Amber's. Conflicts are last-write-wins,
 which is the honest fit for a one-person ecosystem.
+
+**Both controls are still client-driven only — this is the open gap against design
+principle 3.** `set_voice` and `set_model` are frames a *client* sends; Amber has no
+tool that reaches them, so "can you talk slower?" today produces a sentence about
+talking slower rather than a lower `speed`. The plumbing needed is small and already
+shaped for it: the settings live on the `Session`, are validated and clamped in one
+place (`app/voice.py`, `app/models.py`), and are read once per turn — so a registry
+tool that mutates the session's `VoiceSettings` lands on exactly the value the
+Settings page writes, and the existing `voice` / `model` frames already exist to echo
+the change back so the UI stays in sync. The one real design question is scope: a
+voice change is per-connection and cheap to undo, while a keyword *remap* is
+install-wide and persisted, so the second should be harder for a passing remark to
+trigger than the first. Until this lands, every new setting should be built with its
+Amber-facing tool from the start rather than repeating this gap.
 
 **Typed turns.** `user_text` (`{"type": "user_text", "text": "..."}`) is the exact peer
 of a binary utterance: it takes a turn slot, obeys the same rate limit and session cap,
@@ -321,7 +397,8 @@ Key modules: [app/config.py](app/config.py) (all keywords/keys/flags),
 writer and the maintenance loop). The "brain" is
 [app/brain.py](app/brain.py) — a thin wrapper over `agent_runtime.AgentRunner` —
 with its personality in [app/persona.py](app/persona.py) (`compose_system_prompt`
-composes the core, the modality block, the device block, and the per-turn context);
+composes the core, the modality block, the ecosystem block
+([app/ecosystem.py](app/ecosystem.py)), the device block, and the per-turn context);
 [app/signals.py](app/signals.py) and [app/maintenance.py](app/maintenance.py) are
 the self-improvement loop; [app/session.py](app/session.py) holds per-connection
 conversation history. [app/responder.py](app/responder.py) is the canned fallback
@@ -332,13 +409,34 @@ The system prompt is **composed, not monolithic** ([app/persona.py](app/persona.
 `compose_system_prompt` is keyword-only and layers a fixed `CORE` (identity, how to
 answer, tools, memory posture) with blocks that only apply to this turn: a
 **modality** block (`SPOKEN_STYLE` for audio turns, `TYPED_STYLE` for `user_text`
-ones — the pipeline derives it from `text is not None`), a **device** block naming
-the client tools this connection actually declared, and the per-turn context blocks.
+ones — the pipeline derives it from `text is not None`), an **ecosystem** block, a
+**device** block naming the client tools this connection actually declared, and the
+per-turn context blocks.
 That structure exists because one flat prompt drifted badly: it named a deleted
 backend three times, banned emoji then required one, described display tools a
 headless client never had, and gave "spell it for the ear" rules to typed replies.
 A block that's only emitted when it applies can't rot the same way. `SYSTEM_PROMPT`
 is `compose_system_prompt()` with no context — the brain's default.
+
+**Amber knows what she's part of** ([app/ecosystem.py](app/ecosystem.py),
+`build_ecosystem_block`, gated by `AMBER_FEATURE_ECOSYSTEM_CONTEXT`, on). She is the
+natural-language way into this ecosystem, so "what's Bloom?" or "how do you work?"
+must not send her to a web search for something private. The block names each piece —
+herself, Aperture, `agent-runtime`, `agent-mcp-py`, `amber-infra` and its sync store,
+Bloom — in one line each, saying what it's *for*. Two rules keep it from becoming the
+bloat `persona.py` was written to end. **Framework knowledge, not documentation:** no
+paths, config keys or endpoint names, because none of that can be spoken and all of it
+rots when the code moves (a test asserts they're absent). **Claims are checked against
+this install, not the plan:** the static half describes the shape, and `_wiring_block`
+appends only what this process can really reach — peers by their real names, read
+through the same `load_static_peers` the broker uses, the sync store when one is
+configured, "other agents can query you" only when the MCP server actually mounts. It
+closes by telling her the domain apps are planned rather than built, and that a
+missing tool means a missing capability — the failure mode of handing a model an
+architecture diagram is that it starts describing planned features in the present
+tense. It sits with identity rather than with the per-turn blocks, since it's
+background about who she is, and it's budgeted (a test caps it) because every turn
+pays for it.
 
 Per-turn context. `app/runtime_context.py` (`build_runtime_context`) is a one-line
 date/time stamp read in `AMBER_TIMEZONE` (unknown zone → UTC), *always* injected
@@ -576,14 +674,20 @@ All three changes landed, and the voice loop and WS protocol are untouched:
   overhaul (tiered self-curating memory with migrations and FTS retrieval, a
   composed modality-aware prompt, memory-management tools, `auto` search +
   `read_url`, telemetry, and the unattended maintenance pass), plus per-connection
-  voice and model control with a keyword table shared through the sync store. Voice
-  pipeline complete, streaming seam intact, 436 tests in `tests/`. Runs on
-  `agent-runtime` and serves her own MCP server.
+  voice and model control with a keyword table shared through the sync store, and
+  ecosystem self-knowledge in the prompt. Voice pipeline complete, streaming seam
+  intact, 453 tests in `tests/`. Runs on `agent-runtime` and serves her own MCP
+  server.
   - **Not yet done here:** reminders still can't *fire* — they're recorded,
     listable and completable, but delivery needs a server-initiated protocol frame.
     The maintenance scheduler makes that a small follow-on. Long-term memory as
     markdown files is a future phase; the fact tiering is its on-ramp
     (`durable` + `category` + provenance export cleanly to one file per fact).
+  - **Also not done: Amber can't drive her own settings.** `app/tools/` has no
+    voice or model tool, so the per-connection controls are reachable by a client
+    frame and not by asking. This is now the highest-value gap in the repo, because
+    it is the concrete instance of design principle 3 — see the note in the client
+    protocol section for the shape of the fix.
 - **agent-mcp-py**: **built.** The convention layer — auth, depth guard, usage log,
   sync registration. 180 tests, verified end to end against a live server.
 - **agent-runtime**: **built.** The shared agentic loop on OpenRouter's
@@ -591,7 +695,19 @@ All three changes landed, and the voice loop and WS protocol are untouched:
   drives a real `agent-mcp-py` server.
 - Both are pinned in Amber by **commit SHA**, not tag — neither repo is tagged yet.
   Switch the pins in `pyproject.toml` to `@v0.1.0` once they are.
-- **agent-spawner**: not yet built.
+- **agent-spawner**: **built, and it's called `bloom`.** The name in these docs is
+  the design-time one; the repo is `bloom`. It went further than the original spec:
+  rather than routing tasks to models, it's where an *agent is defined instead of
+  built* — a prompt, a model keyword, and the connections (OAuth accounts, API keys,
+  MCP servers) it may act through, from a global library where approving a service
+  once makes it available to every agent. It can also build one from a description
+  ("a Spotify agent that can play and search music"), researching the service and
+  preferring an existing MCP server to an integration it would have to carry. Two
+  surfaces with deliberately separate key sets: `/mcp` (`run_task`, `build_agent`) is
+  how Amber and other agents reach it, `/admin/*` is plain REST because Aperture
+  wants an OpenAPI schema, and a GUI that edits config shouldn't hold a token that
+  spends money. Adding a capability is a row in a table, not a repo and a deploy —
+  which is what makes design principle 4 affordable.
 - **notification-relay**: not yet built.
 - **Hosted sync store**: **built**, in `amber-infra/sync-store` — the server registry,
   Aperture's config blobs, and (new) the shared model-keyword table at `/models`.
@@ -601,12 +717,17 @@ All three changes landed, and the voice loop and WS protocol are untouched:
   **amber-template**: specced, not yet built.
 - **All individual app agents (finance, school, etc.)**: not yet started.
   Finance-agent is the intended first proof point, and is now unblocked — it can be
-  built directly on `agent-mcp-py`.
+  built directly on `agent-mcp-py`. Per design principle 4 it ships backend + MCP
+  server only; its screens are Aperture's job.
 - **FreeCallMe MCP sidecar**: not started — intended as the proof point for the
   "compose external services, don't rewrite the app" pattern.
-- **Aperture**: under way ahead of its planned slot — Electron shell with the chat
-  view, SSH/servers management, Bloom, and the Settings page that drives Amber's
-  voice and model controls over the WS protocol.
+- **Aperture**: under way ahead of its planned slot, and now the centre of gravity
+  rather than a late-stage nicety — Electron shell with the chat view, SSH/servers
+  management, Bloom, and the Settings page that drives Amber's voice and model
+  controls over the WS protocol. Its open work is the design principles above:
+  making each surface visual rather than a text dump, closing the remaining
+  terminal-only operations, and pairing every control it adds with an Amber-facing
+  tool.
 
 ## Build order (current)
 
@@ -617,8 +738,18 @@ All three changes landed, and the voice loop and WS protocol are untouched:
    (registration + discovery), `/models` (the shared keyword table) and `/config`.
    Peers still fall back to the static `AMBER_MCP_PEERS` map when no store is
    configured.
-5. `agent-spawner`
-6. `finance-agent` as first full proof point
-7. FreeCallMe MCP sidecar
-8. Remaining app agents, shared design system, Aperture — roughly in that order, but
-   not strictly blocking each other
+5. **Aperture** — promoted out of last place. It's under way, and the design
+   principles make it the surface every later item is consumed through, so it stops
+   being the thing that waits until the backends are done. Its first job list: Amber
+   tools for her own settings (principle 3), a UI path for every current SSH-only
+   operation (principle 2), and visual renderings of what the chat view currently
+   prints as text (principle 1).
+6. ~~`agent-spawner`~~ — done, as `bloom`
+7. `finance-agent` as first full proof point — backend + MCP server only, rendered in
+   Aperture. Worth deciding first whether it's a repo at all or a Bloom agent with a
+   connection, now that Bloom makes the second cheap
+8. FreeCallMe MCP sidecar
+9. Remaining app agents and the shared design system — roughly in that order, but not
+   strictly blocking each other. Per-app frontends are deliberately absent from this
+   list; they get reconsidered only when an app clearly outgrows what Aperture and
+   Amber give it.

@@ -10,6 +10,9 @@ core with blocks that only apply to this particular turn:
 * the core — identity, how to answer, tools, memory posture. Always.
 * a **modality** block — a spoken turn needs numbers and dates spelled for the ear;
   a typed turn is read on a screen and wants them literal. Same brevity either way.
+* an **ecosystem** block — what she and the software around her are, and what this
+  install can actually reach (`app.ecosystem`). Static background rather than
+  per-turn context, which is why it sits up with identity.
 * a **device** block — named only when the connected client actually declared tools,
   and listing the real names it declared.
 * the per-turn context blocks — the "right now" stamp and the memory block.
@@ -127,20 +130,27 @@ def compose_system_prompt(
     modality: str = "voice",
     client_tool_names: Sequence[str] = (),
     notes_block: str | None = None,
+    ecosystem_block: str | None = None,
 ) -> str:
     """The full system prompt for one turn.
 
     Keyword-only, and emitted in argument order — the previous signature took
     ``(memory_block, runtime_context)`` and emitted them the other way round, which
     is the kind of trap that only bites once you've stopped looking at it.
+    ``ecosystem_block`` is the exception to argument order: it's background about who
+    she is rather than context about this turn, so it's emitted with identity.
 
-    Order matters: identity, then how to behave on this device, then what's true
-    right now, then what Amber knows — each block narrowing from the general to the
-    immediate, with the conversation history arriving after all of it.
+    Order matters: identity, then what she's part of, then how to behave on this
+    device, then what's true right now, then what Amber knows — each block narrowing
+    from the general to the immediate, with the conversation history arriving after
+    all of it.
     """
     parts = [CORE]
 
     parts.append(TYPED_STYLE if modality == "text" else SPOKEN_STYLE)
+
+    if ecosystem_block:
+        parts.append(ecosystem_block)
 
     device = _device_block(client_tool_names)
     if device:

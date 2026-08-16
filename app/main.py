@@ -31,7 +31,7 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, status
 
-from app import model_sync, models, protocol, signals
+from app import model_sync, models, peers, protocol, signals
 from app.config import Settings, get_settings
 from app.pipeline import run_turn
 from app.session import Session, SessionManager, get_session_manager
@@ -49,10 +49,12 @@ logger = logging.getLogger("amber")
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     """Start the background work that runs alongside the voice socket.
 
-    Three things, all optional and all independent of the voice loop:
+    Four things, all optional and all independent of the voice loop:
 
     * the **signal writer**, which batches telemetry to SQLite off the turn path;
     * the **maintenance loop**, which curates memory and writes self-review notes;
+    * the two **sync-store pulls** — the shared model-keyword table, and the peer
+      list that decides which other agents Amber can call at all;
     * **Amber's own MCP server** — a mounted sub-app's lifespan never runs, so the
       host has to enter the session manager itself or the first MCP request fails.
       `agent_mcp` wraps that (plus sync-store registration and its heartbeat).
@@ -76,6 +78,15 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         # re-pointed elsewhere while this box was down is in effect for the first
         # turn after a restart rather than five minutes into it.
         background.append(asyncio.create_task(model_sync.sync_loop(settings)))
+    if peers.discovery_enabled(settings):
+        # Peer discovery. Same shape and the same reason as the keyword sync above:
+        # a peer connected from Aperture while this box was restarting should be
+        # callable on the first turn after it comes back, not five minutes into it.
+        #
+        # Without this the only peers Amber can reach are the ones spelled out in
+        # AMBER_MCP_PEERS — and an unlisted peer produces no error of any kind,
+        # because it is not a failing tool, it is no tool. See app/peers.py.
+        background.append(asyncio.create_task(peers.refresh_loop(settings)))
 
     try:
         if not settings.mcp_server_enabled:

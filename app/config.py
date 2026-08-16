@@ -266,6 +266,13 @@ class Settings(BaseSettings):
     # The periodic self-maintenance pass (app/maintenance.py): decay, promotion,
     # consolidation, pruning, self-review. Off means memory never curates itself.
     feature_maintenance: bool = True
+    # When true, every system prompt carries a short description of the ecosystem
+    # Amber belongs to — Aperture, the shared libraries, the sync store, Bloom (see
+    # app/ecosystem.py). On by default: she is the natural-language way into all of
+    # it, and without this she answers questions about her own system by guessing or
+    # searching the web for something private. Turn it off for a deployment that
+    # wants a plain voice assistant and would rather not pay the tokens every turn.
+    feature_ecosystem_context: bool = True
     # When true, the notes the maintenance pass writes about itself are injected
     # into every system prompt. Default off: reflections are worth *reading* long
     # before they're worth acting on automatically, and this is the line between
@@ -298,6 +305,32 @@ class Settings(BaseSettings):
     # edit pushes immediately, so this is the catch-up for changes made elsewhere.
     # Floored at 30s in the loop.
     model_sync_interval_s: float = 300.0
+
+    # --- Peer discovery ---
+    # Resolve peers through the sync store's registry, not just ``mcp_peers``.
+    #
+    # The bug this closes. ``app.brain.build_broker`` used to build its MCP client
+    # from ``load_static_peers(mcp_peers)`` alone and pass that same dict as the
+    # ``resolver`` — which short-circuits ``agent_mcp.registry.resolve`` entirely.
+    # So with an empty ``AMBER_MCP_PEERS`` no client was constructed at all, and a
+    # peer could register perfectly, appear in ``GET /servers``, and be offered to
+    # the model as nothing whatsoever. There is no error in that state: an unlisted
+    # peer is not a failing tool, it is no tool.
+    #
+    # The store has always held a credential per server, settable only by an admin
+    # and handed out on discovery, and `agent_mcp.PeerRegistry` has always kept a
+    # two-layer cache with static overriding discovered. None of it was reachable
+    # from here. This flag turns the second layer on.
+    #
+    # On by default, because "the peer I registered is callable" is the behaviour
+    # everything else in the ecosystem already assumes. Off pins Amber to the static
+    # map — the switch to reach for when a bad registry entry is sending her
+    # somewhere she should not go, since static always wins anyway.
+    feature_peer_discovery: bool = True
+    # How often the peer list is pulled. Matches agent_mcp's own 300s registration
+    # heartbeat, so a peer that has just registered is discoverable within about one
+    # of its own cycles. Floored at 30s in the loop.
+    peer_sync_interval_s: float = 300.0
 
     # --- Sessions (Phase 5) ---
     # How long an idle session's in-memory history is retained for reconnect/

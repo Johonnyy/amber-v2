@@ -33,6 +33,7 @@ from typing import TYPE_CHECKING
 from app import protocol, signals
 from app.brain import think
 from app.config import get_settings
+from app.ecosystem import build_ecosystem_block
 from app.memory import build_memory_view, build_notes_block, get_store, remember
 from app.persona import compose_system_prompt
 from app.responder import respond
@@ -238,6 +239,10 @@ async def _think_and_speak(
             # What the maintenance pass has noticed about how conversations go.
             # None unless AMBER_FEATURE_SELF_NOTES is on.
             notes_block=await build_notes_block(),
+            # What she and the software around her are, plus what this install can
+            # actually reach. Rebuilt per turn (it's only string joins) so a config
+            # change lands without a restart. None unless the flag is on.
+            ecosystem_block=build_ecosystem_block(),
         )
         tokens = think(
             conversation.messages,

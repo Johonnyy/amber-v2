@@ -22,7 +22,11 @@ lives; it asks a `ToolBroker`. Amber composes hers in priority order:
    exposes the schema/dispatch pair the adapter wants.
 3. *The `expect_reply` signal*, which is not a tool at all — calling it just flips
    a flag on this turn's `TurnSignals` so the pipeline keeps the mic open.
-4. *Peer MCP servers*, when configured, for heavy or delegated work.
+4. *Peer MCP servers*, for heavy or delegated work — from `AMBER_MCP_PEERS` **and**
+   from whatever has registered with the sync store, unioned by
+   `agent_mcp.PeerRegistry` with the static map winning. Reading only the first was
+   a bug with no symptom: an unlisted peer is not a failing tool, it is no tool.
+   See `app.peers`.
 
 Amber's own tools come first so a colliding name from a client or a peer can never
 shadow them.
@@ -67,6 +71,7 @@ from agent_runtime import Settings as RuntimeSettings
 # inventing a second format that would drift.
 from agent_mcp.registry import load_static_peers
 
+from app import peers as peer_discovery
 from app.config import Settings, get_settings
 from app.models import resolve as resolve_model
 from app.persona import SYSTEM_PROMPT
@@ -170,9 +175,35 @@ def build_broker(
         brokers.append(_signal_broker(signals))
 
     if settings.feature_tools:
-        peers = load_static_peers(settings.mcp_peers, settings.mcp_peer_token)
-        if peers:
-            brokers.append(MCPClient(list(peers), resolver=peers))
+        # Peers come from two places, and this used to read only one of them:
+        #
+        #     peers = load_static_peers(settings.mcp_peers, settings.mcp_peer_token)
+        #     if peers:
+        #         brokers.append(MCPClient(list(peers), resolver=peers))
+        #
+        # Both halves of that were wrong. `if peers:` meant an empty AMBER_MCP_PEERS
+        # built no client *at all*, and passing the dict as `resolver` took
+        # MCPClient._resolve's Mapping branch, which returns before it would ever
+        # fall through to agent_mcp's registry. So the sync store's discovered layer
+        # was unreachable either way — a peer could register perfectly, appear in
+        # GET /servers, and be offered to the model as nothing whatsoever, with no
+        # error anywhere, because an unlisted peer is not a failing tool, it is no
+        # tool. See app/peers.py for the whole account.
+        #
+        # The static layer is re-asserted per turn rather than once at import: it is
+        # cheap, and it keeps `AMBER_MCP_PEERS` authoritative over anything a
+        # background pull has since discovered. That ordering is agent_mcp's contract
+        # and worth honouring — pointing Amber at a local peer during an incident
+        # must not be quietly undone by the next refresh.
+        registry = peer_discovery.registry()
+        registry.set_static(load_static_peers(settings.mcp_peers, settings.mcp_peer_token))
+        # `known()` is the union of both layers; `resolve` is the two-layer lookup,
+        # synchronous and I/O-free, so handing it over as a callable costs the turn
+        # path nothing. A name that vanishes from the registry between here and the
+        # call raises a clear KeyError rather than a NoneType crash.
+        names = registry.known()
+        if names:
+            brokers.append(MCPClient(names, resolver=registry.resolve))
 
     if not brokers:
         return None
