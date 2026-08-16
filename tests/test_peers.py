@@ -46,21 +46,11 @@ def _settings(**over):
     return Settings(_env_file=None, **base)
 
 
-@pytest.fixture(autouse=True)
-def clean_registry():
-    """Both layers of the process-wide registry, restored around every test.
-
-    `app.peers.registry()` deliberately returns `agent_mcp`'s module-level singleton
-    rather than one of Amber's — a second registry would be a second answer to "where
-    is bloom". The cost of that correctness is exactly this: it is shared state, and a
-    test that seeds a peer would otherwise leak it into
-    ``test_no_peers_means_no_mcp_client`` in the neighbouring file and make it fail
-    for a reason that has nothing to do with what it is testing.
-    """
-    reg = default_registry()
-    static, discovered = dict(reg._static), dict(reg._discovered)
-    yield reg
-    reg._static, reg._discovered = static, discovered
+# The registry is emptied around every test by an autouse fixture in conftest.py.
+# It lives there rather than here because the state is process-wide and more than one
+# test file writes to it — `test_ecosystem.py` does too, since building the ecosystem
+# block re-asserts the static layer. A snapshot-and-restore fixture local to this file
+# was not enough: it faithfully restored whatever the *previous file* had left behind.
 
 
 class _FakeResponse:

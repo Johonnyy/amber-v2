@@ -55,7 +55,7 @@ import logging
 from datetime import datetime, timezone
 from typing import Any
 
-from agent_mcp.registry import PeerRegistry, default_registry
+from agent_mcp.registry import PeerRegistry, default_registry, load_static_peers
 
 from app.config import Settings, get_settings
 
@@ -84,6 +84,29 @@ def registry() -> PeerRegistry:
     problem `app.config`'s one-prefix rule exists to prevent.
     """
     return default_registry()
+
+
+def known_peers(settings: Settings | None = None) -> list[str]:
+    """Every peer this install can reach — the static map unioned with the discovered.
+
+    **The** list. Both readers go through here: `app.brain.build_broker`, which turns
+    it into tools, and `app.ecosystem`, which turns it into a sentence in the system
+    prompt. That is not tidiness, it is the bug they had. Amber's prompt told her
+    Bloom "is what specialised work gets handed to" while her tool list had no
+    ``bloom__*`` in it, so she answered "I can hand work off to the bloom agent" and
+    then, asked to actually do it, invented npm commands for a Python service. A
+    model cannot tell the difference between a capability it has and one its prompt
+    asserts; the only fix is for the two to be computed once.
+
+    Re-asserting the static layer is the reason this is not a pure read. It is a dict
+    copy, no I/O, and it has to happen somewhere every turn so that removing a peer
+    from ``AMBER_MCP_PEERS`` does not leave it resolving for the life of the process.
+    Doing it here means it happens whether the prompt or the broker is built first.
+    """
+    settings = settings or get_settings()
+    reg = registry()
+    reg.set_static(load_static_peers(settings.mcp_peers, settings.mcp_peer_token))
+    return reg.known()
 
 
 def discovery_enabled(settings: Settings | None = None) -> bool:

@@ -195,15 +195,19 @@ def build_broker(
         # background pull has since discovered. That ordering is agent_mcp's contract
         # and worth honouring — pointing Amber at a local peer during an incident
         # must not be quietly undone by the next refresh.
-        registry = peer_discovery.registry()
-        registry.set_static(load_static_peers(settings.mcp_peers, settings.mcp_peer_token))
-        # `known()` is the union of both layers; `resolve` is the two-layer lookup,
-        # synchronous and I/O-free, so handing it over as a callable costs the turn
-        # path nothing. A name that vanishes from the registry between here and the
-        # call raises a clear KeyError rather than a NoneType crash.
-        names = registry.known()
+        # `known_peers` is the union of both layers, and it is deliberately the same
+        # call `app.ecosystem` makes to decide what the *prompt* says Amber can reach.
+        # Those two disagreeing is its own outage: the prompt asserted she could hand
+        # work to Bloom while the broker offered no bloom__* tool, so she claimed the
+        # capability in one breath and invented npm commands in the next.
+        #
+        # `resolve` is the two-layer lookup, synchronous and I/O-free, so handing it
+        # over as a callable costs the turn path nothing. A name that vanishes from
+        # the registry between here and the call raises a clear KeyError rather than
+        # a NoneType crash.
+        names = peer_discovery.known_peers(settings)
         if names:
-            brokers.append(MCPClient(names, resolver=registry.resolve))
+            brokers.append(MCPClient(names, resolver=peer_discovery.registry().resolve))
 
     if not brokers:
         return None
