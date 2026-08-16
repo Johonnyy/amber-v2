@@ -132,6 +132,36 @@ def test_parse_facts_respects_limit():
     assert _contents(_parse_facts(raw, 2)) == ["a", "b"]
 
 
+# --- structural debris ---
+#
+# A preamble before the fence defeats both `json.loads` and the fence strip, so
+# the reply used to reach the line reader, which stored "```json" and "[]" as
+# facts. They then looked undeletable in the panel: forgetting one only hides the
+# row, and `add_fact` matches active rows only, so the next junk extraction
+# inserted a fresh one saying the same thing.
+
+
+def test_parse_facts_finds_the_array_after_a_preamble():
+    raw = 'Here is the JSON:\n```json\n["Lives in Berlin"]\n```'
+    assert _contents(_parse_facts(raw, 5)) == ["Lives in Berlin"]
+
+
+def test_parse_facts_keeps_no_fact_when_the_preambled_array_is_empty():
+    assert _parse_facts("Nothing worth keeping:\n```json\n[]\n```", 5) == []
+
+
+@pytest.mark.parametrize(
+    "junk", ["```", "```json", "[]", "{}", "[", "]", "---", ",", "JSON", '"facts":']
+)
+def test_parse_facts_never_stores_structural_debris(junk):
+    assert _parse_facts(junk, 5) == []
+
+
+def test_parse_facts_drops_debris_but_keeps_real_lines():
+    raw = "```json\n- Likes tea\n]\n```"
+    assert _contents(_parse_facts(raw, 5)) == ["Likes tea"]
+
+
 # --- extract_facts ---
 
 async def test_extract_facts_uses_configured_model_and_parses():

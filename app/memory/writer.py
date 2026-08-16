@@ -104,6 +104,33 @@ def _build_payload(user_text: str, assistant_text: str, known: Iterable[str]) ->
 
 _FENCE_RE = re.compile(r"^```(?:json)?\s*|\s*```$", re.IGNORECASE)
 
+# A distilled fact is a short sentence about a person, so it contains letters.
+# Anything without one is structural debris — a bare ``[]``, a stray bracket, a
+# lone code fence — which is exactly what the line-based fallback below yields
+# when the model prefaces its array with prose the fence strip can't reach.
+#
+# Storing one is close to unfixable from the UI, which is why this guard is worth
+# more than it looks: `store.add_fact` matches only *active* rows, so forgetting a
+# junk fact doesn't stop the next junk extraction inserting a brand-new row saying
+# the same thing. From the panel it reads as a memory that cannot be deleted.
+_LETTER_RE = re.compile(r"[^\W\d_]")
+
+# Fragments that do contain letters but still aren't facts: JSON scaffolding, and
+# the sentinels a model reaches for when it has nothing to say.
+_NON_FACTS = frozenset(
+    {"json", "fact", "facts", "null", "true", "false", "none", "n/a", "nothing"}
+)
+
+
+def _is_junk(content: str) -> bool:
+    """True for anything that is punctuation or scaffolding rather than a fact."""
+    if content.lstrip().startswith("```"):
+        return True
+    stripped = content.strip().strip("`\"'[]{},:").strip().lower()
+    if not stripped or stripped in _NON_FACTS:
+        return True
+    return _LETTER_RE.search(content) is None
+
 
 def _normalize(item: Any) -> dict | None:
     """One parsed entry as ``{content, category, tier, replaces}``, or None if junk.
@@ -123,7 +150,7 @@ def _normalize(item: Any) -> dict | None:
     else:
         return None
 
-    if not content or content.lower() in ("none", "n/a"):
+    if _is_junk(content):
         return None
     # A rambling "fact" is worse than none: it goes into every future prompt at full
     # token cost and crowds out the punchy ones. Anything this long is a summary the
@@ -140,29 +167,51 @@ def _normalize(item: Any) -> dict | None:
     }
 
 
+def _load_json(text: str) -> list[Any] | None:
+    """The reply as a list of entries, or ``None`` if this text isn't JSON."""
+    try:
+        parsed = json.loads(text)
+    except (json.JSONDecodeError, ValueError):
+        return None
+    if isinstance(parsed, list):
+        return list(parsed)
+    if isinstance(parsed, dict):
+        # A lone object, or {"facts": [...]} — both show up occasionally.
+        inner = parsed.get("facts")
+        return list(inner) if isinstance(inner, list) else [parsed]
+    return None
+
+
 def _parse_facts(raw: str, limit: int) -> list[dict]:
     """Parse the model's reply into a clean, capped list of fact records.
 
     Tolerant of the usual model output quirks: code fences, a JSON array of plain
     strings instead of objects, or a newline/bulleted list instead of any JSON.
+
+    Three passes, narrowing: the whole text, then the outermost ``[...]`` inside
+    it, then lines. The middle one exists because a preamble ("Here's what I
+    found:") sits *before* the fence, so the fence strip no longer anchors and the
+    whole reply used to drop to the line reader — which stored the preamble and
+    the fence markers themselves as facts.
     """
     text = _FENCE_RE.sub("", raw.strip()).strip()
-    items: list[Any] = []
 
-    try:
-        parsed = json.loads(text)
-        if isinstance(parsed, list):
-            items = list(parsed)
-        elif isinstance(parsed, dict):
-            # A lone object, or {"facts": [...]} — both show up occasionally.
-            inner = parsed.get("facts")
-            items = list(inner) if isinstance(inner, list) else [parsed]
-    except (json.JSONDecodeError, ValueError):
-        # Fallback: treat each non-empty line as a fact, stripping bullets/quotes.
-        for line in text.splitlines():
-            line = line.strip().lstrip("-*•").strip().strip('"').strip()
-            if line and line not in ("[", "]"):
-                items.append(line)
+    items = _load_json(text)
+    if items is None:
+        start, end = text.find("["), text.rfind("]")
+        if 0 <= start < end:
+            items = _load_json(text[start : end + 1])
+    if items is None:
+        # Last resort: treat each non-empty line as a fact, stripping bullets and
+        # quotes. `_normalize` discards the scaffolding this inevitably sweeps up.
+        items = [
+            line
+            for line in (
+                ln.strip().lstrip("-*•").strip().strip('"').strip()
+                for ln in text.splitlines()
+            )
+            if line
+        ]
 
     facts = [f for f in (_normalize(i) for i in items) if f is not None]
     return facts[:limit]
