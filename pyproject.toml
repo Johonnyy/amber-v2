@@ -24,7 +24,7 @@ dependencies = [
     "agent-runtime[mcp] @ git+https://github.com/Johonnyy/agent-runtime@9621f42",
     # The convention layer for Amber's own MCP server, so other agents and
     # Aperture can query her memory, tasks, and reminders.
-    "agent-mcp-py @ git+https://github.com/Johonnyy/agent-mcp-py@fa9a3c2",
+    "agent-mcp-py @ git+https://github.com/Johonnyy/agent-mcp-py@01b7493",
 ]
 
 [project.optional-dependencies]
