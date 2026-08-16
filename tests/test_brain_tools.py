@@ -47,13 +47,14 @@ class _RecordingRunner:
         self.chunks = ["Hello ", "there."]
         _RecordingRunner.instances.append(self)
 
-    def stream(self, messages, *, system=None, conversation_id=None, depth=0):
+    def stream(self, messages, *, system=None, conversation_id=None, depth=0, state=None):
         self.stream_calls.append(
             {
                 "messages": messages,
                 "system": system,
                 "conversation_id": conversation_id,
                 "depth": depth,
+                "state": state,
             }
         )
 
@@ -470,3 +471,76 @@ async def test_think_forwards_client_tools_and_signals(recorder, monkeypatch):
     broker = recorder.instances[0].broker
     names = {s["function"]["name"] for s in await broker.list_tools()}
     assert {"client_show_text", brain.EXPECT_REPLY_TOOL, "add_task"} <= names
+
+
+# --- spend, which used to be thrown away entirely ---
+
+
+async def test_the_stream_state_reaches_the_runner(recorder, monkeypatch):
+    """`stream` used to build its own and drop it, so nothing was ever recorded."""
+    from agent_runtime import RunState
+
+    monkeypatch.setattr(brain, "get_settings", _settings)
+    state = RunState()
+    await _collect([{"role": "user", "content": "hi"}], state=state)
+
+    assert recorder.instances[0].stream_calls[0]["state"] is state
+
+
+async def test_record_spend_writes_a_cost_row(tmp_path, monkeypatch):
+    """The regression this exists for: Amber had never written one.
+
+    `AgentRunner.stream` discarded its state and the recording step was reachable
+    only from `run()`, which Amber does not call — so `runtime_settings` pointed the
+    cost tracker at her database and nothing ever arrived in it.
+    """
+    from agent_runtime import RunState
+    from agent_runtime.cost_tracker import get_tracker
+    from agent_runtime.stop_conditions import Step
+
+    db = str(tmp_path / "amber.db")
+    settings = _settings(memory_db_path=db)
+    monkeypatch.setattr(brain, "get_settings", lambda: settings)
+
+    state = RunState()
+    state.steps.append(
+        Step(
+            index=0,
+            model="anthropic/claude-sonnet-4.6",
+            text="hello",
+            tokens_in=100,
+            tokens_out=25,
+            cost_usd=0.0042,
+        )
+    )
+
+    total = await brain.record_spend(state, conversation_id="sess-1")
+
+    assert total == pytest.approx(0.0042)
+    summary = get_tracker(brain.runtime_settings(settings)).summary()
+    assert summary["calls"] == 1
+    assert summary["tokens_in"] == 100
+    assert summary["total_cost_usd"] == pytest.approx(0.0042)
+
+
+async def test_record_spend_is_a_no_op_without_steps(monkeypatch):
+    monkeypatch.setattr(brain, "get_settings", _settings)
+    from agent_runtime import RunState
+
+    assert await brain.record_spend(None) == 0.0
+    assert await brain.record_spend(RunState()) == 0.0
+
+
+async def test_record_spend_never_raises(monkeypatch):
+    """Bookkeeping is not worth a turn that already succeeded."""
+    from agent_runtime import RunState
+    from agent_runtime.stop_conditions import Step
+
+    monkeypatch.setattr(brain, "get_settings", _settings)
+    monkeypatch.setattr(
+        brain, "runtime_settings", lambda *a, **k: (_ for _ in ()).throw(OSError("nope"))
+    )
+    state = RunState()
+    state.steps.append(Step(index=0, model="m", cost_usd=1.0))
+
+    assert await brain.record_spend(state) == pytest.approx(1.0)

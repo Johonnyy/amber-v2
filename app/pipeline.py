@@ -30,8 +30,10 @@ import logging
 from collections.abc import AsyncIterator, Awaitable, Callable
 from typing import TYPE_CHECKING
 
+from agent_runtime import RunState
+
 from app import protocol, signals
-from app.brain import think
+from app.brain import record_spend as brain_record_spend, think
 from app.config import get_settings
 from app.ecosystem import build_ecosystem_block
 from app.memory import build_memory_view, build_notes_block, get_store, remember
@@ -121,6 +123,7 @@ async def run_turn(
     # The canned/empty path never awaits; the brain path sets this via expect_reply.
     awaiting = False
     used_fact_ids: list[int] = []
+    stats: dict = {}
     try:
         if not transcript_text:
             # Nothing heard (silence, or STT disabled) — reprompt without spending
@@ -129,7 +132,7 @@ async def run_turn(
                 _canned(_DIDNT_CATCH), send_json, send_bytes, voice
             )
         else:
-            spoken, reply, awaiting, used_fact_ids = await _think_and_speak(
+            spoken, reply, awaiting, used_fact_ids, stats = await _think_and_speak(
                 transcript_text,
                 conversation,
                 send_json,
@@ -145,7 +148,9 @@ async def run_turn(
     finally:
         await send_json(protocol.thinking(False))
 
-    await send_json(protocol.turn_complete(spoken, awaiting_response=awaiting))
+    await send_json(
+        protocol.turn_complete(spoken, awaiting_response=awaiting, **stats)
+    )
 
     # Telemetry, queued rather than written — nothing here waits on SQLite. A
     # correction is the strongest signal Amber got something wrong, and the only one
@@ -210,6 +215,9 @@ async def _think_and_speak(
     settings = get_settings()
     signals = TurnSignals()
     used_fact_ids: list[int] = []
+    # Collects what each model call actually cost. Passed to the runner and read
+    # after the stream drains — see `brain.record_spend`.
+    state = RunState()
     # A cold turn — the first of a fresh or reconnected session, before this user
     # turn is recorded — has no live history yet, so the brain gets a "where you left
     # off" recap from durable memory. Once the session has turns of its own they
@@ -251,6 +259,13 @@ async def _think_and_speak(
             signals=signals,
             conversation_id=conversation_id,
             model=model,
+            # The same sink the reply travels on. Tool frames are emitted from inside
+            # the broker, which runs on this very task — so they interleave with
+            # `audio_chunk` in true order without a queue or a lock.
+            activity=send_json if settings.feature_activity_stream else None,
+            # Collects each step's model, tokens, cost and timings — recorded below,
+            # after the reply is out. See `brain.record_spend`.
+            state=state,
         )
     else:
         tokens = respond(transcript_text)
@@ -259,13 +274,44 @@ async def _think_and_speak(
     spoken = 0
     try:
         spoken = await _speak_stream(
-            _capture(tokens, spoken_text), send_json, send_bytes, voice
+            _capture(
+                tokens,
+                spoken_text,
+                send_json if settings.feature_text_stream else None,
+            ),
+            send_json,
+            send_bytes,
+            voice,
         )
     finally:
         reply = "".join(spoken_text).strip()
         if reply:
             conversation.add_assistant(reply)
-    return spoken, reply, signals.awaiting_response, used_fact_ids
+        # Here rather than inside the stream, and in the same `finally` that persists
+        # a partial reply, for the same reason: an interrupted turn still happened and
+        # still cost money. `record_spend` never raises.
+        cost = await brain_record_spend(state, conversation_id=conversation_id)
+    return spoken, reply, signals.awaiting_response, used_fact_ids, _stats(state, cost)
+
+
+def _stats(state: RunState, cost: float) -> dict:
+    """Per-turn numbers for `turn_complete`, or nothing at all.
+
+    Empty when there were no steps, so the frame keeps the exact shape it had before
+    on the canned path and on any install where cost tracking is off. That is the
+    difference between an additive field and a changed one.
+    """
+    if not state.steps:
+        return {}
+    return {
+        "steps": len(state.steps),
+        "tokens_in": sum(step.tokens_in for step in state.steps),
+        "tokens_out": sum(step.tokens_out for step in state.steps),
+        "cost_usd": cost,
+        # The model that actually answered, which is not always what the keyword
+        # resolved to at the start — the table can be re-pointed between turns.
+        "model": state.steps[-1].model,
+    }
 
 
 async def _remember_safe(
@@ -297,11 +343,27 @@ async def _touch_safe(fact_ids: list[int]) -> None:
 
 
 async def _capture(
-    tokens: AsyncIterator[str], sink: list[str]
+    tokens: AsyncIterator[str],
+    sink: list[str],
+    send_json: SendJson | None = None,
 ) -> AsyncIterator[str]:
-    """Pass tokens through unchanged while accumulating them for history."""
+    """Pass tokens through unchanged while accumulating them for history.
+
+    Also the tee point for the ``delta`` frame, when ``send_json`` is given. Here
+    rather than anywhere downstream because this is the last place the model's own
+    text still exists as the model wrote it: the very next stage is the sentence
+    splitter, which is where newlines, headings and code fences stop being
+    recoverable. ``audio_chunk`` carries sentences because *speech* is made of
+    sentences; a screen is not, and reconstructing one from the other is guesswork.
+
+    Deliberately not wrapped in a try: a send that fails here fails for the same
+    reason the next ``audio_chunk`` would, and swallowing it would only delay the
+    turn's error by one sentence.
+    """
     async for chunk in tokens:
         sink.append(chunk)
+        if send_json is not None and chunk:
+            await send_json(protocol.delta(chunk))
         yield chunk
 
 

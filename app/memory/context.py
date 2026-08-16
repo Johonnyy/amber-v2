@@ -65,8 +65,8 @@ class MemoryView:
 
     * ``block`` — the compressed text appended to the system prompt, or ``None``.
     * ``items`` — the ranked fact strings for the ``memory`` protocol frame.
-    * ``facts`` — the same facts as ``{id, content, tier}`` records, for a client
-      that wants to render or reference them.
+    * ``facts`` — the same facts as ``_WIRE_FIELDS`` records, for a client that
+      wants to render or reference them.
     * ``fact_ids`` — what the pipeline touches after the turn completes, which is
       the only evidence memory has that a fact was worth including.
     """
@@ -292,8 +292,32 @@ async def build_memory_view(
     return MemoryView(
         block=block,
         items=[f["content"] for f in facts],
-        facts=[
-            {"id": f["id"], "content": f["content"], "tier": f["tier"]} for f in facts
-        ],
+        facts=[wire_fact(f) for f in facts],
         fact_ids=[f["id"] for f in facts],
     )
+
+
+#: What a client sees of a fact. `rank_facts` returns all twelve columns and this
+#: used to keep three, which cost nothing to widen — the rows are already in memory,
+#: already paid for. The five added are exactly what a panel needs to be more than a
+#: bulleted list: whether Amber is confident, whether the fact has earned its place
+#: (`use_count`), when it was last useful, what kind of thing it is, and whether it
+#: was told to her outright or inferred from something said in passing.
+#:
+#: `status` and `superseded_by` are left out deliberately — this view is of *active*
+#: facts, so one is a constant and the other is only meaningful in an audit trail.
+_WIRE_FIELDS = (
+    "id",
+    "content",
+    "tier",
+    "category",
+    "confidence",
+    "use_count",
+    "last_used_at",
+    "source",
+)
+
+
+def wire_fact(row: dict) -> dict:
+    """Project one fact row down to what the `memory` frame carries."""
+    return {key: row[key] for key in _WIRE_FIELDS if key in row}

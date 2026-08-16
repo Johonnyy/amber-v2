@@ -21,7 +21,7 @@ dependencies = [
     # used to live in app/brain.py, which is why `anthropic` is no longer a
     # dependency here. The [mcp] extra brings the MCP SDK so Amber can call other
     # apps' servers as a client.
-    "agent-runtime[mcp] @ git+https://github.com/Johonnyy/agent-runtime@6f648fd",
+    "agent-runtime[mcp] @ git+https://github.com/Johonnyy/agent-runtime@d4cf149",
     # The convention layer for Amber's own MCP server, so other agents and
     # Aperture can query her memory, tasks, and reminders.
     "agent-mcp-py @ git+https://github.com/Johonnyy/agent-mcp-py@01b7493",

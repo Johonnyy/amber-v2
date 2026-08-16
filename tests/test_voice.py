@@ -176,11 +176,12 @@ def fresh_caches():
 
 
 def _handshake(ws) -> dict:
-    """Consume ``ready`` + ``voice`` + ``model``, returning the voice frame."""
+    """Consume ``ready`` + ``voice`` + ``model`` + ``status``, returning the voice frame."""
     assert ws.receive_json()["type"] == protocol.READY
     frame = ws.receive_json()
     assert frame["type"] == protocol.VOICE
     assert ws.receive_json()["type"] == protocol.MODEL
+    assert ws.receive_json()["type"] == protocol.STATUS
     return frame
 
 

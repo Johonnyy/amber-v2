@@ -299,8 +299,30 @@ pull would silently restore the override. With no `AMBER_MCP_SYNC_STORE_URL` the
 whole module is inert and the table is simply Amber's. Conflicts are last-write-wins,
 which is the honest fit for a one-person ecosystem.
 
-**Both controls are still client-driven only — this is the open gap against design
-principle 3.** `set_voice` and `set_model` are frames a *client* sends; Amber has no
+**A turn is now visible while it happens.** Two additive server→client frames close
+the gap where a client had two states to render — thinking and speaking — for a turn
+that might have run a search, corrected a memory and handed a two-minute build to
+Bloom in between. `activity` reports every tool call twice, on dispatch and on
+return, correlated by id and tagged with which of the four brokers served it
+(`own` / `client` / `signal` / `peer:<name>`, recovered from the naming convention by
+`peers.classify_tool_name`). `delta` carries the raw reply text before the sentence
+splitter sees it — `audio_chunk` is the *speech* view and loses the model's own
+whitespace, so a client that concatenates sentences can never render a heading, a
+list or a code fence.
+
+The seam is `app/activity.py`: a `ToolBroker` decorator wrapping the assembled
+broker in `build_broker`. Not `registry.dispatch`, which looks like the obvious
+choke point and is only Amber's *own* tools — instrumenting there would have shown
+the searches and hidden every `bloom__*` call, which are the slow ones worth
+watching. Wrapping the composite covers all four classes and closes the matching
+telemetry hole on the way past. Two rules are load-bearing: emission never raises,
+and a barge-in emits **nothing** — that path also runs when the connection is
+closing, so the socket may be gone, and it sits between the user interrupting and
+Amber listening again. A call still open at `turn_complete` is an interrupted call,
+and the client already knows because it sent the `interrupt`.
+
+**Both voice and model controls are still client-driven only — this is the open gap
+against design principle 3.** `set_voice` and `set_model` are frames a *client* sends; Amber has no
 tool that reaches them, so "can you talk slower?" today produces a sentence about
 talking slower rather than a lower `speed`. The plumbing needed is small and already
 shaped for it: the settings live on the `Session`, are validated and clamped in one
@@ -703,6 +725,20 @@ All three changes landed, and the voice loop and WS protocol are untouched:
     frame and not by asking. This is now the highest-value gap in the repo, because
     it is the concrete instance of design principle 3 — see the note in the client
     protocol section for the shape of the fix.
+  - **New: the turn is observable.** `activity` and `delta` frames
+    ([app/protocol.py](app/protocol.py), [app/activity.py](app/activity.py)), a
+    `status` frame carrying peers/sync/features ([app/status.py](app/status.py)),
+    and client-driven memory curation — `memory_action` / `memory_query`
+    ([app/memory_control.py](app/memory_control.py)) landing on the *same* store
+    functions the `forget_fact` / `correct_fact` tools call, so a fact forgotten by
+    asking and one forgotten by clicking are the same row. 527 tests.
+  - **Fixed, and it had never worked:** `AgentRunner.stream` built its bookkeeping
+    state inline and discarded it, and the recording step was reachable only from
+    `run()` — which Amber never calls. So every voice turn threw away its model,
+    token counts, cost and timings, and **Amber had never written a single cost
+    row**, despite `runtime_settings` carefully pointing the tracker at her own
+    database. `stream(state=)` is now additive upstream and `brain.record_spend`
+    writes after the reply is out; `turn_complete` carries the numbers.
 - **agent-mcp-py**: **built.** The convention layer — auth, depth guard, usage log,
   sync registration. 180 tests, verified end to end against a live server.
 - **agent-runtime**: **built.** The shared agentic loop on OpenRouter's
@@ -746,10 +782,28 @@ All three changes landed, and the voice loop and WS protocol are untouched:
 - **Aperture**: under way ahead of its planned slot, and now the centre of gravity
   rather than a late-stage nicety — Electron shell with the chat view, SSH/servers
   management, Bloom, and the Settings page that drives Amber's voice and model
-  controls over the WS protocol. Its open work is the design principles above:
-  making each surface visual rather than a text dump, closing the remaining
-  terminal-only operations, and pairing every control it adds with an Amber-facing
-  tool.
+  controls over the WS protocol.
+  - **The visual pass has landed** (design principle 1). The chat is a *timeline*
+    rather than a list of bubbles: messages and tool calls share one array, because
+    their interleaving is the information. Tool calls render as collapsed cards with
+    a live elapsed counter — a peer call may legitimately run for minutes, so a card
+    with no visible progress is indistinguishable from one that has hung. A
+    `bloom__build_agent` card expands into the **same** live build timeline the Bloom
+    tab draws, which is what makes "build a spotify agent" watchable without leaving
+    the Amber page. Replies render as markdown, from `delta`.
+  - **Bloom's build view** replaces ~60–75 flat rows with a four-phase rail derived
+    from the tool names (`bloom/build/phases.ts`, covered by `verify:activity`),
+    collapsed per-phase groups, a capability grid built from the durable build row,
+    and one cost strip instead of the twenty `step_finished` lines that all land at
+    once. `TraceView` stays the single entry point so live and history cannot drift.
+  - **The right sidebar** is an instrument stack, not a log: a pinned summary
+    (connection, runs in flight, spend), then Running / Memory / System / Spend, with
+    the old trace demoted to a filterable bottom section. Memory facts show tier,
+    confidence and use count with a one-click forget and a real undo — Amber's delete
+    is soft, so restoring brings back the same row. Resizable, and sections narrow
+    themselves per view rather than sitting open and empty.
+  - Still open: the terminal-only operations (principle 2), and the Amber-facing
+    tools for the settings the UI can already write (principle 3).
 
 ## Build order (current)
 

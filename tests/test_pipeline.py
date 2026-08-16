@@ -315,3 +315,100 @@ async def test_typed_text_ignores_stt_flag(fake_io, monkeypatch):
         assert conv.messages[0]["content"] == "still works"
     finally:
         pipeline.get_settings.cache_clear()
+
+
+# --- delta: the text view of a reply ---------------------------------------- #
+
+
+async def test_deltas_carry_the_models_own_whitespace(fake_io, monkeypatch):
+    """The whole reason the frame exists.
+
+    ``audio_chunk`` carries sentences because speech is made of sentences; a client
+    that concatenates them has to guess the whitespace between, so a heading or a
+    list is gone by the time it reaches a screen. The delta stream is the same reply
+    with the newlines still in it.
+    """
+    monkeypatch.setattr(
+        pipeline, "think", fake_brain("## Results\n\n", "- one\n", "- two\n")
+    )
+
+    sink = FakeSink()
+    await pipeline.run_turn(b"a", sink.send_json, sink.send_bytes, Conversation())
+
+    raw = "".join(m["text"] for m in sink.json if m["type"] == protocol.DELTA)
+    assert raw == "## Results\n\n- one\n- two\n"
+
+    # The sentence path, meanwhile, has flattened it — which is correct for speech.
+    spoken = " ".join(
+        m["text"] for m in sink.json if m["type"] == protocol.AUDIO_CHUNK
+    )
+    assert "\n" not in spoken
+
+
+async def test_deltas_precede_the_audio_they_describe(fake_io, monkeypatch):
+    """Order matters: a client renders text, then hears it.
+
+    Both frames go out on one task with no queue between them, so this is a real
+    guarantee rather than a race that usually lands the right way up.
+    """
+    monkeypatch.setattr(pipeline, "think", fake_brain("First. ", "Second. "))
+
+    sink = FakeSink()
+    await pipeline.run_turn(b"a", sink.send_json, sink.send_bytes, Conversation())
+
+    types = [m["type"] for m in sink.json]
+    assert types.index(protocol.DELTA) < types.index(protocol.AUDIO_CHUNK)
+
+
+async def test_the_text_stream_can_be_turned_off(fake_io, monkeypatch):
+    """Off means the frames are simply never sent — every client behaves as before."""
+    monkeypatch.setattr(pipeline, "think", fake_brain("Sure."))
+    monkeypatch.setenv("AMBER_FEATURE_TEXT_STREAM", "false")
+    pipeline.get_settings.cache_clear()
+
+    sink = FakeSink()
+    try:
+        await pipeline.run_turn(b"a", sink.send_json, sink.send_bytes, Conversation())
+        assert not [m for m in sink.json if m["type"] == protocol.DELTA]
+        # ...and the reply still arrives by the path that predates it.
+        assert [m for m in sink.json if m["type"] == protocol.AUDIO_CHUNK]
+    finally:
+        pipeline.get_settings.cache_clear()
+
+
+async def test_the_activity_sink_reaches_the_brain(fake_io, monkeypatch):
+    """`run_turn` hands the brain the same socket the reply travels on."""
+    seen = {}
+
+    async def think(messages, system=None, activity=None, **kw):
+        seen["activity"] = activity
+        yield "Done."
+
+    monkeypatch.setattr(pipeline, "think", think)
+
+    sink = FakeSink()
+    await pipeline.run_turn(b"a", sink.send_json, sink.send_bytes, Conversation())
+
+    assert seen["activity"] is not None
+    # Prove it is a live sink rather than merely non-None.
+    await seen["activity"](protocol.activity("c1", "start", "web_search", origin="own"))
+    assert sink.json[-1]["name"] == "web_search"
+
+
+async def test_the_activity_stream_can_be_turned_off(fake_io, monkeypatch):
+    seen = {}
+
+    async def think(messages, system=None, activity=None, **kw):
+        seen["activity"] = activity
+        yield "Done."
+
+    monkeypatch.setattr(pipeline, "think", think)
+    monkeypatch.setenv("AMBER_FEATURE_ACTIVITY_STREAM", "false")
+    pipeline.get_settings.cache_clear()
+
+    sink = FakeSink()
+    try:
+        await pipeline.run_turn(b"a", sink.send_json, sink.send_bytes, Conversation())
+        assert seen["activity"] is None
+    finally:
+        pipeline.get_settings.cache_clear()

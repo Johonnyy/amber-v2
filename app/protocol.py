@@ -82,6 +82,51 @@ Turn-based conversations extend ``turn_complete`` *additively* with an optional
 to answer, so the client should keep the mic open and send the next utterance as a
 continuation. The key is present only when ``True``; old clients ignore it and fall
 back to one-shot turns. The field is per-turn, never sticky.
+
+Turn visibility adds two more *additive* server -> client frames, so a client can show
+what a turn is actually doing instead of a spinner:
+
+  * ``activity`` — one tool call, twice: ``phase="start"`` when it is dispatched and
+    ``phase="end"`` when it returns, correlated by ``id``. Purely advisory, exactly
+    like ``memory``: it never affects the voice loop and a client that ignores it
+    behaves as before.
+
+    It is emphatically **not** ``tool_call``. That frame is a *request* — Amber asking
+    the client to run one of the client's own tools, blocking until a ``tool_result``
+    comes back. ``activity`` is a *report* about work Amber is doing herself, and the
+    client owes nothing in reply. Conflating the two would make a UI look like it had
+    an unanswered obligation on every search.
+
+    ``origin`` says which of the four brokers served the call, since the model sees
+    one flat tool list: ``own`` (Amber's registry), ``client`` (this device's declared
+    tools), ``signal`` (``expect_reply``, which does no work), or ``peer:<name>`` for a
+    peer MCP server. A ``start`` is what makes a long call legible — a peer call may
+    legitimately run for minutes — so a client should render on ``start`` and patch on
+    ``end`` rather than waiting for a completed pair.
+
+  * ``delta`` — raw reply text as the model produces it, before the sentence splitter
+    sees it. ``audio_chunk`` already carries each spoken sentence, but sentences are
+    the *speech* view: they arrive whole, and a client that concatenates them has to
+    guess at the whitespace between, so newlines, headings, lists and code fences are
+    gone by the time they reach a screen. ``delta`` is the *text* view of the same
+    reply, and it is what makes rendering markdown possible.
+
+    Both describe one reply, so a client renders **one or the other, never both** —
+    prefer ``delta`` when any arrives and fall back to joining ``audio_chunk`` text
+    otherwise, which is what keeps this additive for a client (or a server) that
+    predates it.
+
+    Two things about its pacing, because the obvious assumption is wrong. Synthesis
+    applies backpressure all the way up: while a sentence is being spoken nothing
+    pulls on the model stream, so text does **not** race ahead of speech. It leads by
+    about one sentence — the one being synthesized — and then waits. This is a
+    readable reply that keeps pace with the voice, not a fast document render.
+
+    And on a barge-in, the last sentence's ``delta`` text is already sent while its
+    audio never was, so a client holding both can mark anything past the final
+    ``audio_chunk`` as written-but-unspoken. Amber's own history has always recorded
+    what was *streamed* rather than what was *heard*, so this matches what she thinks
+    she said.
 """
 
 from __future__ import annotations
@@ -95,6 +140,8 @@ REGISTER_TOOLS = "register_tools"  # client declares tools Amber may call on it
 TOOL_RESULT = "tool_result"  # the result of a client-side tool call (see TOOL_CALL)
 SET_VOICE = "set_voice"  # patch how Amber sounds on this connection
 SET_MODEL = "set_model"  # pick this connection's brain, and/or re-point a keyword
+MEMORY_ACTION = "memory_action"  # forget / restore / correct one remembered fact
+MEMORY_QUERY = "memory_query"  # browse or search everything Amber remembers
 
 # --- server -> client message types ---
 READY = "ready"  # handshake accepted; server is listening
@@ -106,7 +153,22 @@ MEMORY = "memory"  # what Amber currently remembers about the user (advisory)
 TOOL_CALL = "tool_call"  # asks the client to run one of its declared tools
 VOICE = "voice"  # the voice settings in effect, and what this Amber accepts
 MODEL = "model"  # the brain in effect, and the keyword catalogue behind it
+ACTIVITY = "activity"  # a tool call starting or finishing (advisory; see the docstring)
+DELTA = "delta"  # raw reply text as generated, for rendering (advisory)
+STATUS = "status"  # what this install can reach and what it has spent (advisory)
 ERROR = "error"  # something went wrong this turn
+
+# --- the two phases of an ``activity`` frame ---
+PHASE_START = "start"
+PHASE_END = "end"
+
+# --- ``activity.origin``: which broker served the call ---
+# The model sees one flat tool list, so the origin has to be recovered from the name.
+# `app.peers.classify_tool_name` is the one place that mapping lives.
+ORIGIN_OWN = "own"  # Amber's own registry (app.tools)
+ORIGIN_CLIENT = "client"  # a tool this device declared via ``register_tools``
+ORIGIN_SIGNAL = "signal"  # ``expect_reply`` — a back-channel flag, not real work
+ORIGIN_PEER_PREFIX = "peer:"  # a peer MCP server, e.g. ``peer:bloom``
 
 # --- error codes (the optional ``code`` field on an error frame) ---
 ERR_RATE_LIMITED = "rate_limited"  # too many utterances too fast; back off
@@ -153,7 +215,9 @@ def audio_chunk(index: int, text: str, audio_format: str) -> dict[str, Any]:
     }
 
 
-def turn_complete(sentences: int, awaiting_response: bool = False) -> dict[str, Any]:
+def turn_complete(
+    sentences: int, awaiting_response: bool = False, **stats: Any
+) -> dict[str, Any]:
     """The full response has been sent.
 
     ``awaiting_response`` (turn-based conversations) is ``True`` when Amber asked
@@ -165,11 +229,22 @@ def turn_complete(sentences: int, awaiting_response: bool = False) -> dict[str, 
     frame: dict[str, Any] = {"type": TURN_COMPLETE, "sentences": sentences}
     if awaiting_response:
         frame["awaiting_response"] = True
+    # What the turn cost: ``steps``, ``tokens_in``, ``tokens_out``, ``cost_usd``,
+    # ``model``. Attached only when there is something to say, so the canned path and
+    # an install with cost tracking off still send the bare two-key frame. This is
+    # newly *possible* rather than newly collected — the numbers always existed and
+    # `AgentRunner.stream` discarded them.
+    frame.update(stats)
     return frame
 
 
 def memory(
-    items: list[str], facts: list[dict[str, Any]] | None = None
+    items: list[str],
+    facts: list[dict[str, Any]] | None = None,
+    *,
+    scope: str = "turn",
+    ack: dict[str, Any] | None = None,
+    total: int | None = None,
 ) -> dict[str, Any]:
     """The facts Amber is drawing on this turn, surfaced for the client to display.
 
@@ -182,10 +257,27 @@ def memory(
     existing client is untouched. The ids let a memory panel reference a specific
     fact (to show it, or to offer to correct it); the tier says whether Amber
     considers it settled knowledge or something still proving itself.
+
+    ``scope`` says *why* this frame arrived, because one shape now answers two
+    questions. ``"turn"`` is the original meaning — what Amber is drawing on right
+    now, sent unprompted before the reply. ``"browse"`` answers a ``memory_query``
+    and is everything she knows rather than what this turn needed, so a panel must
+    not let the second quietly overwrite the first. ``total`` is how many active
+    facts exist, so a browse can say what it is a slice of. ``ack`` settles a
+    ``memory_action``: ``{"action", "id", "ok", "content"}``.
+
+    All three are attached only when they apply, so the frame a client already parses
+    is unchanged in the case it already handles.
     """
     frame: dict[str, Any] = {"type": MEMORY, "items": list(items)}
     if facts:
         frame["facts"] = [dict(f) for f in facts]
+    if scope != "turn":
+        frame["scope"] = scope
+    if total is not None:
+        frame["total"] = total
+    if ack is not None:
+        frame["ack"] = dict(ack)
     return frame
 
 
@@ -202,6 +294,90 @@ def tool_call(call_id: str, name: str, tool_input: dict[str, Any]) -> dict[str, 
         "name": name,
         "input": tool_input,
     }
+
+
+def activity(
+    call_id: str,
+    phase: str,
+    name: str,
+    *,
+    origin: str,
+    tool_input: dict[str, Any] | None = None,
+    result: str | None = None,
+    ok: bool | None = None,
+    ms: int | None = None,
+    read_only: bool | None = None,
+) -> dict[str, Any]:
+    """One tool call, reported to the client as it starts and again as it ends.
+
+    ``call_id`` correlates the pair — a client creates a row on ``start`` and patches
+    it on ``end``, which is the whole point: a peer call can run for minutes, so a
+    frame that only arrived on completion would leave the longest calls invisible for
+    exactly as long as they were interesting.
+
+    ``origin`` is one of the ``ORIGIN_*`` constants (``peer:<name>`` for peers). Only
+    the fields that apply to this phase are attached, so a ``start`` frame carries no
+    ``ok`` key rather than a null one — the same shape discipline the rest of this
+    module keeps, and it lets a client treat "absent" as "not known yet".
+
+    Advisory in the strict sense: nothing here feeds back into the turn, so dropping
+    every one of these frames changes only what a screen shows.
+
+    **An interrupted call gets no ``end``.** A barge-in cancels the turn while the
+    call is still in flight, and the cancellation path is the one place a send is
+    genuinely unsafe — it also runs when the *connection* is closing, and it sits
+    directly between the user interrupting and Amber listening again. So a client
+    should treat a call still open when ``turn_complete`` arrives as interrupted. It
+    already knows: it sent the ``interrupt``.
+    """
+    frame: dict[str, Any] = {
+        "type": ACTIVITY,
+        "id": call_id,
+        "phase": phase,
+        "name": name,
+        "origin": origin,
+    }
+    if tool_input is not None:
+        frame["input"] = tool_input
+    if read_only is not None:
+        frame["read_only"] = read_only
+    if result is not None:
+        frame["result"] = result
+    if ok is not None:
+        frame["ok"] = ok
+    if ms is not None:
+        frame["ms"] = ms
+    return frame
+
+
+def status(**sections: Any) -> dict[str, Any]:
+    """What this install can reach, what it is running, and what it has spent.
+
+    The same discipline `voice` and `model` established: **the server says what is
+    true rather than the client hardcoding it.** All of this already existed and was
+    simply never sent — `peers.status()`, `peers.known_peers()`, `model_sync.status()`,
+    the memory fact count, the lifespan's background tasks — reachable only from
+    Python, so a UI could infer a peer's existence solely from a tool name it happened
+    to see.
+
+    Sections are passed through as given so this stays a transport rather than a
+    schema to keep in step with six other modules. Advisory, like `memory` and
+    `activity`: a client that ignores it loses a panel, not a turn.
+
+    **Never put a peer's token in here.** `PeerRecord` carries one, and the shape of
+    this frame invites handing the whole record over.
+    """
+    return {"type": STATUS, **sections}
+
+
+def delta(text: str) -> dict[str, Any]:
+    """Raw reply text, as generated, before the sentence splitter sees it.
+
+    The text peer of ``audio_chunk``: same reply, but with the model's own whitespace
+    intact, which is what a client needs to render markdown. Render one or the other,
+    never both — see the module docstring.
+    """
+    return {"type": DELTA, "text": text}
 
 
 def voice(

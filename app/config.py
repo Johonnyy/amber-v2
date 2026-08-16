@@ -293,6 +293,23 @@ class Settings(BaseSettings):
     # "Amber notices patterns" and "Amber edits her own instructions". Turn it on
     # once a few real reflections have been read and judged sane.
     feature_self_notes: bool = False
+    # Turn visibility: when true, every tool call is reported to the client as it
+    # starts and again as it finishes (the additive ``activity`` frame), so a UI can
+    # show what a turn is *doing* rather than a spinner. Advisory — nothing here
+    # feeds back into the turn — and off means the frames are simply never sent,
+    # which is exactly how every client behaved before they existed.
+    feature_activity_stream: bool = True
+    # When true, raw reply text is streamed as it is generated (the additive
+    # ``delta`` frame) alongside the sentence-by-sentence audio path. Sentences are
+    # the *speech* view of a reply and lose the model's own whitespace, so a client
+    # that wants to render markdown needs this one. Off costs nothing but flat text.
+    feature_text_stream: bool = True
+    # When true, a client may forget, restore and correct remembered facts, and browse
+    # everything Amber knows (the ``memory_action`` / ``memory_query`` frames). The
+    # model-facing half of this — the ``forget_fact`` / ``correct_fact`` tools — has
+    # always existed, so off leaves memory curatable by asking but not by clicking.
+    # Deletion is soft either way, so a mistake here is recoverable.
+    feature_memory_control: bool = True
 
     # --- Amber's own MCP server ---
     # Comma-separated bearer tokens other agents present to query Amber, each

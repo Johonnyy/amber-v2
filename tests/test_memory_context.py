@@ -203,9 +203,24 @@ async def test_the_block_carries_ids_so_facts_can_be_acted_on(store):
     # Without ids, correcting a fact costs a search round trip first.
     assert f"[#{fact_id}]" in view.block
     assert view.fact_ids == [fact_id]
-    assert view.facts == [
-        {"id": fact_id, "content": "Lives in Boston", "tier": "short"}
-    ]
+
+    (fact,) = view.facts
+    # The three a Phase-3 client already reads, unchanged.
+    assert fact["id"] == fact_id
+    assert fact["content"] == "Lives in Boston"
+    assert fact["tier"] == "short"
+    # Plus what a memory panel needs to be more than a bulleted list. These cost
+    # nothing — `rank_facts` already returns the whole row and this used to throw
+    # them away — and they are what lets a fact show whether it has earned its keep.
+    assert fact["confidence"] == pytest.approx(0.6)
+    assert fact["use_count"] == 0
+    assert fact["source"] == "extracted"
+    assert "last_used_at" in fact
+    assert "category" in fact
+    # Never the audit columns: this view is of active facts, so `status` is a
+    # constant here and `superseded_by` only means anything in a history view.
+    assert "status" not in fact
+    assert "superseded_by" not in fact
 
 
 async def test_open_tasks_are_capped(store):

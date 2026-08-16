@@ -53,6 +53,7 @@ is meant to be changeable.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from collections.abc import AsyncIterator
 from typing import TYPE_CHECKING
@@ -63,6 +64,7 @@ from agent_runtime import (
     CompositeBroker,
     LocalToolBroker,
     MCPClient,
+    RunState,
 )
 from agent_runtime import Settings as RuntimeSettings
 
@@ -71,6 +73,7 @@ from agent_runtime import Settings as RuntimeSettings
 # inventing a second format that would drift.
 from agent_mcp.registry import load_static_peers
 
+from app import activity as activity_stream
 from app import peers as peer_discovery
 from app.config import Settings, get_settings
 from app.models import resolve as resolve_model
@@ -78,6 +81,7 @@ from app.persona import SYSTEM_PROMPT
 from app.tools import get_tool_schemas, run_tool
 
 if TYPE_CHECKING:
+    from app.activity import SendJson
     from app.client_tools import ClientTools
     from app.turn_signals import TurnSignals
 
@@ -151,14 +155,22 @@ def build_broker(
     *,
     client_tools: "ClientTools | None" = None,
     signals: "TurnSignals | None" = None,
+    activity: "SendJson | None" = None,
 ):
     """Assemble this turn's tool broker, or ``None`` when there is nothing to offer.
 
     Order is priority order: Amber's own tools resolve first, so a client or peer
     that declares a colliding name cannot shadow them.
+
+    ``activity`` is the connection's frame sink. When given, the whole stack is
+    wrapped in `app.activity.ActivityBroker` so every call the model makes is
+    reported to the client as it happens. The wrap goes *outside* everything rather
+    than around each broker individually, which is the only position that sees all
+    four classes of tool — and the only one that stays correct when a broker is added.
     """
     settings = settings or get_settings()
     brokers: list = []
+    peer_names: list[str] = []
 
     if settings.feature_tools:
         brokers.append(AnthropicRegistryBroker(get_tool_schemas, run_tool))
@@ -206,14 +218,56 @@ def build_broker(
         # the registry between here and the call raises a clear KeyError rather than
         # a NoneType crash.
         names = peer_discovery.known_peers(settings)
+        peer_names = names
         if names:
             brokers.append(MCPClient(names, resolver=peer_discovery.registry().resolve))
 
     if not brokers:
         return None
-    if len(brokers) == 1:
-        return brokers[0]
-    return CompositeBroker(brokers)
+    broker = brokers[0] if len(brokers) == 1 else CompositeBroker(brokers)
+    # The same peer list the client was built from, so a call is classified against
+    # what this turn could actually reach rather than a second, later lookup that
+    # might disagree with it.
+    return activity_stream.wrap(
+        broker,
+        activity,
+        peers=peer_names,
+        enabled=settings.feature_activity_stream,
+    )
+
+
+async def record_spend(
+    state: RunState | None,
+    *,
+    conversation_id: str | None = None,
+    settings: Settings | None = None,
+) -> float:
+    """Write a finished turn's model spend to the cost table. Returns what it cost.
+
+    Called by the pipeline once the reply has been spoken, never from inside the
+    stream. Two reasons, both learned the hard way elsewhere in this codebase:
+    recording hops to a thread, and a thread hop on the barge-in path is latency
+    between the user interrupting and Amber listening again; and a `finally` that
+    awaits during cancellation is the shape that swallows the cancellation.
+
+    An interrupted turn still records what it spent up to that point. The steps are
+    appended as the run proceeds, so a partial run leaves a partial but honest
+    record — and an expensive turn is exactly the one most likely to be cut short.
+
+    Never raises. Bookkeeping is not worth a turn that already succeeded.
+    """
+    if state is None or not state.steps:
+        return 0.0
+    settings = settings or get_settings()
+    total = sum(step.cost_usd for step in state.steps)
+    try:
+        runner = AgentRunner(model="", broker=None, settings=runtime_settings(settings))
+        await runner.record_steps(state.steps, conversation_id=conversation_id)
+    except asyncio.CancelledError:
+        raise
+    except Exception:  # noqa: BLE001 — never fail a completed turn over bookkeeping
+        logger.debug("Could not record turn spend", exc_info=True)
+    return total
 
 
 async def think(
@@ -224,6 +278,8 @@ async def think(
     signals: "TurnSignals | None" = None,
     conversation_id: str | None = None,
     model: str | None = None,
+    activity: "SendJson | None" = None,
+    state: RunState | None = None,
 ) -> AsyncIterator[str]:
     """Stream Amber's reply for the given conversation history.
 
@@ -246,13 +302,27 @@ async def think(
     possible moment, so a keyword re-pointed between two turns takes effect on the
     second one without anything being invalidated or restarted.
 
-    Yields text deltas as they arrive. Tool round trips happen inside and are
-    invisible here, apart from a newline at each tool boundary so speech before a
-    tool reaches TTS without waiting for the tool to finish.
+    ``activity`` is the connection's frame sink, threaded down to the broker so tool
+    calls are reported to the client as they happen. It changes nothing about what
+    this function yields.
+
+    ``state`` collects each step's model, tokens, cost and timings. Supply one and
+    hand it to `record_spend` once this generator has drained — see the note at the
+    call site for why the caller owns that rather than this function.
+
+    Yields text deltas as they arrive. Tool round trips still happen inside and are
+    invisible *in this stream*, apart from a newline at each tool boundary so speech
+    before a tool reaches TTS without waiting for the tool to finish. They are no
+    longer invisible to the client, which is what ``activity`` is for.
     """
     settings = get_settings()
     system = system if system is not None else SYSTEM_PROMPT
-    broker = build_broker(settings, client_tools=client_tools, signals=signals)
+    broker = build_broker(
+        settings,
+        client_tools=client_tools,
+        signals=signals,
+        activity=activity,
+    )
 
     keyword = model or settings.llm_tier
     resolved = resolve_model(keyword, settings)
@@ -272,6 +342,17 @@ async def think(
     )
 
     async for text in runner.stream(
-        messages, system=system, conversation_id=conversation_id
+        messages,
+        system=system,
+        conversation_id=conversation_id,
+        # Keep what the stream would otherwise discard. `AgentRunner.stream` used to
+        # build this inline and drop it, and the recording step is only reachable
+        # from `run()` — which Amber never calls. So every voice turn threw away its
+        # model id, token counts, cost and timings, and Amber had **never written a
+        # single cost row**, despite `runtime_settings` carefully pointing the tracker
+        # at her database. A spend panel would have been empty, and correctly so.
+        #
+        # The caller owns it, and records from its own `finally` — see `record_spend`.
+        state=state,
     ):
         yield text

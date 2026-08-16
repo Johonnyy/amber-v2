@@ -31,7 +31,10 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, status
 
-from app import model_sync, models, peers, protocol, signals
+from app import memory_control, model_sync, models, peers, protocol, signals
+# Aliased: `fastapi.status` is already imported above for the WS close codes, and
+# these two would otherwise be one name meaning two things in the same module.
+from app import status as status_report
 from app.config import Settings, get_settings
 from app.pipeline import run_turn
 from app.session import Session, SessionManager, get_session_manager
@@ -175,6 +178,10 @@ async def voice_socket(websocket: WebSocket) -> None:
     # client can show the model without asking, and additive so one that doesn't know
     # the frame ignores it.
     await websocket.send_json(_model_frame(session, settings))
+    # And what this install can actually reach — peers, sync, which halves of Amber
+    # are switched on. Same terms again: the server says what is true so a client
+    # doesn't infer it from tool names it happens to see go past.
+    await websocket.send_json(protocol.status(**await status_report.build(session, settings)))
     logger.info(
         "[%s] Client %s (%d turn(s) of history)",
         session.id,
@@ -410,6 +417,23 @@ async def _handle_control(
             payload.get("content", ""),
             bool(payload.get("is_error")),
         )
+    elif kind in (protocol.MEMORY_ACTION, protocol.MEMORY_QUERY):
+        # Curating memory from the UI, landing on the same store functions Amber's
+        # own `forget_fact` / `correct_fact` tools call. Two ways in, one code path —
+        # a fact forgotten by asking and one forgotten by clicking are the same row
+        # in the same state.
+        if not memory_control.enabled(settings):
+            logger.debug("[%s] Ignoring %s (memory control off)", session.id, kind)
+            return
+        handler = (
+            memory_control.handle_action
+            if kind == protocol.MEMORY_ACTION
+            else memory_control.handle_query
+        )
+        try:
+            await send_json(await handler(payload, settings))
+        except Exception:  # noqa: BLE001 — a memory panel is never worth the socket
+            logger.exception("[%s] %s failed", session.id, kind)
     else:
         logger.debug("[%s] Ignoring unknown control frame: %r", session.id, payload)
 

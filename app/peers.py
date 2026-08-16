@@ -52,11 +52,15 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from collections.abc import Collection
 from datetime import datetime, timezone
 from typing import Any
 
 from agent_mcp.registry import PeerRegistry, default_registry, load_static_peers
+from agent_runtime.mcp_client import NAMESPACE_SEP
 
+from app import protocol
+from app.client_tools import CLIENT_PREFIX
 from app.config import APP_NAME, Settings, get_settings
 
 logger = logging.getLogger(__name__)
@@ -123,6 +127,45 @@ def known_peers(settings: Settings | None = None) -> list[str]:
     reg.set_self_name(APP_NAME)
     reg.set_static(load_static_peers(settings.mcp_peers, settings.mcp_peer_token))
     return reg.known()
+
+
+#: Tool names that are back-channel signals rather than work. `app.brain` owns the
+#: tool itself (``EXPECT_REPLY_TOOL``); naming it here rather than importing it keeps
+#: this module free of a cycle, since `app.brain` imports *this* one. A test asserts
+#: the two agree.
+SIGNAL_TOOL_NAMES = frozenset({"expect_reply"})
+
+
+def classify_tool_name(name: str, peers: Collection[str] = ()) -> str:
+    """Which broker served a tool call, recovered from the name alone.
+
+    The model is handed one flat tool list, so by the time a call comes back the only
+    thing distinguishing Amber's own ``add_task`` from Bloom's ``bloom__run_task`` or
+    the device's ``client_show_text`` is the naming convention each broker applies.
+    Returns one of `app.protocol`'s ``ORIGIN_*`` values, with peers as
+    ``"peer:<name>"``.
+
+    **The peer split has to come first**, and that ordering is the whole reason this
+    is a function rather than a couple of ``startswith`` calls at the call site. A peer
+    named ``client`` produces ``client__foo``, which ``startswith("client_")`` matches
+    perfectly happily — so checking the device prefix first would file another agent's
+    tools as this laptop's. Splitting on ``NAMESPACE_SEP`` first and requiring the
+    prefix to be a *known* peer makes the two unambiguous in both directions: a local
+    tool with a double underscore in its name falls through to ``own`` rather than
+    inventing a peer.
+
+    ``peers`` is passed in rather than read from `known_peers` so this stays pure —
+    it runs once per tool call on the turn path, and it is the piece a verify script
+    can exercise without a registry.
+    """
+    server, sep, original = name.partition(NAMESPACE_SEP)
+    if sep and original and server in peers:
+        return f"{protocol.ORIGIN_PEER_PREFIX}{server}"
+    if name in SIGNAL_TOOL_NAMES:
+        return protocol.ORIGIN_SIGNAL
+    if name.startswith(CLIENT_PREFIX):
+        return protocol.ORIGIN_CLIENT
+    return protocol.ORIGIN_OWN
 
 
 def discovery_enabled(settings: Settings | None = None) -> bool:

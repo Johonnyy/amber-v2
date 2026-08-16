@@ -53,9 +53,9 @@ def fresh_caches():
 
 
 def _read_ready(ws) -> dict:
-    """Consume the handshake — ``ready`` plus the ``voice`` and ``model`` frames.
+    """Consume the handshake — ``ready``, then ``voice``, ``model`` and ``status``.
 
-    All three are sent unconditionally before anything else, so swallowing them here
+    All four are sent unconditionally before anything else, so swallowing them here
     keeps every test's first ``receive_json`` the frame it actually cares about.
     """
     frame = ws.receive_json()
@@ -64,6 +64,8 @@ def _read_ready(ws) -> dict:
     assert voice["type"] == protocol.VOICE
     model = ws.receive_json()
     assert model["type"] == protocol.MODEL
+    state = ws.receive_json()
+    assert state["type"] == protocol.STATUS
     return frame
 
 
