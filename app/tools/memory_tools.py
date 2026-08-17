@@ -236,13 +236,22 @@ async def forget_fact(fact_id: int) -> str:
     read_only=True,
 )
 async def list_reminders() -> str:
+    from app.tools.reminders import format_when
+
     reminders = await asyncio.to_thread(get_store().pending_reminders)
     if not reminders:
         return "There are no pending reminders."
-    lines = [
-        f"#{r['id']}: {r['text']}" + (f" (at {r['remind_at']})" if r["remind_at"] else "")
-        for r in reminders
-    ]
+    lines = []
+    for r in reminders:
+        # Times are stored as UTC and spoken in the user's zone.
+        line = f"#{r['id']}: {r['text']}"
+        if r["remind_at"]:
+            line += f" (at {format_when(r['remind_at'])})"
+        # Already announced but not ticked off — worth distinguishing, since the user
+        # asking "what's pending?" has plainly not dealt with the one that just fired.
+        if r.get("fired_at"):
+            line += " — already reminded"
+        lines.append(line)
     return "Pending reminders:\n" + "\n".join(lines)
 
 

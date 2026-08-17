@@ -65,6 +65,7 @@ class Tool:
     func: ToolFunc
     available: Callable[[], bool] = field(default=_always)
     read_only: bool = False
+    requires_confirmation: bool = False
 
     def schema(self) -> dict[str, Any]:
         """This tool as an Anthropic tool-definition dict.
@@ -72,14 +73,24 @@ class Tool:
         Query tools carry ``x_agent.read_only``, the ecosystem-wide convention from
         CLAUDE.md — the same shape `agent_runtime`'s ``LocalToolBroker`` emits, so a
         caller can tell what's safe to retry without knowing which broker answered.
+
+        ``x_agent.requires_confirmation`` rides in the same block and is read by
+        `app.confirm.ConfirmBroker`, which is what actually stops the call and asks. It
+        sits here rather than in the broker so a tool declares its own risk next to its
+        description, and so a peer's declaration and Amber's own are the same field.
         """
         schema: dict[str, Any] = {
             "name": self.name,
             "description": self.description,
             "input_schema": self.input_schema,
         }
+        flags: dict[str, Any] = {}
         if self.read_only:
-            schema["x_agent"] = {"read_only": True}
+            flags["read_only"] = True
+        if self.requires_confirmation:
+            flags["requires_confirmation"] = True
+        if flags:
+            schema["x_agent"] = flags
         return schema
 
 
@@ -97,6 +108,7 @@ class ToolRegistry:
         *,
         available: Callable[[], bool] | None = None,
         read_only: bool = False,
+        requires_confirmation: bool = False,
     ) -> Callable[[ToolFunc], ToolFunc]:
         """Decorator: register the wrapped function as a tool.
 
@@ -104,6 +116,12 @@ class ToolRegistry:
         ``available`` is an optional predicate evaluated at schema/dispatch time;
         when it returns falsey the tool is hidden and won't run. ``read_only`` marks
         a query tool — it changes nothing, so it's always safe to call or retry.
+
+        ``requires_confirmation`` marks a tool that must not run until a human says so.
+        Use it sparingly and only for genuinely consequential, hard-to-undo actions: it
+        blocks the turn on a person, and a tool that asks every time is one the user
+        learns to approve without reading. Enforcement lives in `app.confirm`, which
+        refuses the call outright when nobody is connected to answer.
         """
 
         def decorator(func: ToolFunc) -> ToolFunc:
@@ -116,6 +134,7 @@ class ToolRegistry:
                 func=func,
                 available=available or _always,
                 read_only=read_only,
+                requires_confirmation=requires_confirmation,
             )
             return func
 

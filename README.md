@@ -115,13 +115,34 @@ python scripts/smoke_client.py path/to/utterance.wav
 
 Every client speaks this; see [app/protocol.py](app/protocol.py) for exact shapes.
 
-- **Send** a binary frame = one recorded utterance.
+- **Send** a binary frame = one recorded utterance, or `{"type":"user_text","text":…}`
+  when you already have the words.
 - **Send** `{"type":"interrupt"}` = stop Amber mid-reply. Sending new audio while
   Amber is speaking also barges in (cancels the current turn).
-- **Receive** JSON control frames (`ready`, `transcript`, `thinking`,
-  `audio_chunk`, `memory`, `turn_complete`, `error`) interleaved with binary audio
-  frames. Each `audio_chunk` frame is immediately followed by the binary audio for
-  that sentence.
+- **Send** control frames to change things: `set_voice`, `set_model`,
+  `register_tools`, `tool_result`, `memory_action`, `memory_query`, `push_ack`,
+  `confirm_response`.
+- **Receive** JSON control frames interleaved with binary audio frames. Each
+  `audio_chunk` is immediately followed by the binary audio for that sentence.
+  - Per turn: `transcript`, `thinking`, `memory`, `activity`, `delta`,
+    `audio_chunk`, `turn_complete`, `error`.
+  - On connect: `ready`, then `voice`, `model` and `status` — the server says what is
+    true rather than the client shipping a copy that drifts.
+  - `tool_call` asks the client to run one of its own declared tools.
+
+Two frames Amber **originates**, rather than sending in reply to something:
+
+- `push` — a fired reminder, a maintenance note, something that finished elsewhere.
+  Held in a durable outbox when nothing is connected and delivered on the next
+  connect, so delivery is **at-least-once**: dedupe on `id`. Never sent mid-turn.
+- `confirm_request` — Amber is about to run a tool that needs human approval and is
+  blocked until a `confirm_response` arrives. **Silence is a refusal.**
+
+Frames are added additively, and ignoring one is safe for all of them **except
+`confirm_request`** — the only frame a client genuinely owes an answer to. A client
+that ignores it doesn't break, but the turn stalls for `AMBER_CONFIRM_TIMEOUT_S`
+before the tool is refused. Set `AMBER_FEATURE_CONFIRMATIONS=false` for clients that
+will never answer, and read `status.features` to know which frames this install sends.
 
 ## Amber's MCP server
 

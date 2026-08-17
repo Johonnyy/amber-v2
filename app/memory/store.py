@@ -42,6 +42,7 @@ False``) and every call is serialized under a lock, which is plenty for one user
 
 from __future__ import annotations
 
+import json
 import logging
 import re
 import sqlite3
@@ -268,6 +269,48 @@ def _m6_model_keywords(conn: sqlite3.Connection) -> None:
     )
 
 
+def _m7_push_outbox(conn: sqlite3.Connection) -> None:
+    """Things Amber wants to say when nobody asked — held until someone is listening.
+
+    This table is why a push is durable rather than best-effort. Every other advisory
+    frame describes a turn in progress, so missing one costs nothing that outlives the
+    turn; a reminder due at 17:30 while the socket is down is exactly the case that must
+    survive. In-memory would not do: Amber restarts on every deploy.
+
+    ``id`` is a text primary key minted once at enqueue and reused on every redelivery —
+    that stability is what lets a client dedupe under at-least-once delivery. ``ref`` is
+    JSON pointing at the row this came from, so an acknowledgment can act on the thing
+    rather than merely dismiss the card.
+    """
+    conn.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS push_outbox (
+            id           TEXT    PRIMARY KEY,
+            kind         TEXT    NOT NULL,
+            text         TEXT    NOT NULL,
+            title        TEXT,
+            ref          TEXT,                              -- JSON, or NULL
+            created_at   TEXT    NOT NULL,
+            delivered_at TEXT,
+            status       TEXT    NOT NULL DEFAULT 'pending' -- 'pending'|'delivered'|'expired'
+        );
+        CREATE INDEX IF NOT EXISTS idx_push_outbox_status
+            ON push_outbox (status, created_at);
+        """
+    )
+
+
+def _m8_reminder_fired(conn: sqlite3.Connection) -> None:
+    """When a reminder was actually delivered — which is not the same as done.
+
+    ``status`` has only ever been ``'pending'|'done'``, and firing a reminder is neither:
+    a reminder that has been spoken but not acted on is still pending, and collapsing the
+    two would mean delivery silently completed the user's task for them. Nullable with no
+    default, because an existing row genuinely has never fired.
+    """
+    conn.execute("ALTER TABLE reminders ADD COLUMN fired_at TEXT")
+
+
 # Ordered; index + 1 is the schema version each one produces. Append only.
 _MIGRATIONS: tuple[Callable[[sqlite3.Connection], None], ...] = (
     _m1_baseline,
@@ -276,6 +319,8 @@ _MIGRATIONS: tuple[Callable[[sqlite3.Connection], None], ...] = (
     _m4_events_and_reflections,
     _m5_fts,
     _m6_model_keywords,
+    _m7_push_outbox,
+    _m8_reminder_fired,
 )
 
 # The FTS migration is allowed to fail (old SQLite); the rest are not.
@@ -293,6 +338,22 @@ def _tier_rank(tier: str | None) -> int:
 def _now() -> str:
     """Current UTC time as an ISO-8601 string (lexically sortable)."""
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def _parse_iso(value: str | None) -> datetime | None:
+    """One stored timestamp as an aware datetime, or ``None`` if it won't parse.
+
+    A naive value is read as UTC, which is what every column here except `remind_at`
+    has always been. Reminders are the exception and `app.reminders` handles them in
+    the user's own zone; this is the safe general reading.
+    """
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+    except (ValueError, AttributeError):
+        return None
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
 
 
 def _iso_days_ago(days: float) -> str:
@@ -944,9 +1005,9 @@ class MemoryStore:
     # --- reminders ---
 
     def add_reminder(self, text: str, remind_at: str | None = None) -> int:
-        """Persist a reminder. ``remind_at`` is an ISO-8601 time, or ``None`` if
-        the user gave no time. Delivery/firing is still future work (it needs a
-        server-initiated push frame); this durably records the intent."""
+        """Persist a reminder. ``remind_at`` is an ISO-8601 time, or ``None`` if the
+        user gave no time — and, since `app.reminders` began firing these, an
+        **offset-aware** one. `app.tools.reminders` normalises before it gets here."""
         text = text.strip()
         with self._lock:
             cur = self._conn.execute(
@@ -958,24 +1019,73 @@ class MemoryStore:
             return int(cur.lastrowid)
 
     def pending_reminders(self) -> list[dict]:
-        """Reminders not yet delivered, oldest first."""
+        """Reminders the user hasn't finished with, oldest first.
+
+        Includes ones already *fired*: delivery is not completion, so a reminder that
+        was spoken an hour ago and never acted on still belongs in this list.
+        """
         with self._lock:
             rows = self._conn.execute(
-                "SELECT id, text, remind_at, status, created_at FROM reminders "
+                "SELECT id, text, remind_at, status, created_at, fired_at FROM reminders "
                 "WHERE status = 'pending' ORDER BY id ASC"
             ).fetchall()
         return [dict(r) for r in rows]
 
-    def due_reminders(self, now_iso: str | None = None) -> list[dict]:
-        """Pending reminders whose time has arrived, oldest due first."""
+    def undelivered_reminders(self) -> list[dict]:
+        """Every timed reminder still waiting to fire, regardless of whether it is due.
+
+        Deliberately does **not** compare times in SQL. `remind_at` was stored verbatim
+        for most of this project's life — the `set_reminder` tool asked the model for
+        local time "with no offset", so old rows are naive while new ones are
+        offset-aware, and a lexical `<=` against a UTC now silently mis-fires the naive
+        ones by the length of the offset. `app.reminders` parses each candidate and
+        compares instants. The set is one person's reminders; correctness is worth more
+        than the index here.
+        """
         with self._lock:
             rows = self._conn.execute(
-                "SELECT id, text, remind_at, status, created_at FROM reminders "
-                "WHERE status = 'pending' AND remind_at IS NOT NULL AND remind_at <= ? "
-                "ORDER BY remind_at ASC",
-                (now_iso or _now(),),
+                "SELECT id, text, remind_at, status, created_at, fired_at FROM reminders "
+                "WHERE status = 'pending' AND remind_at IS NOT NULL AND fired_at IS NULL "
+                "ORDER BY remind_at ASC"
             ).fetchall()
         return [dict(r) for r in rows]
+
+    def due_reminders(self, now_iso: str | None = None) -> list[dict]:
+        """Pending, unfired reminders whose time has arrived, oldest due first.
+
+        Compares **instants**, not strings. It used to do `remind_at <= ?` in SQL, which
+        was wrong in a way nothing had noticed because nothing called this: `remind_at`
+        holds whatever offset the reminder was written with while `_now()` is UTC, so a
+        23:00 Denver reminder sorts as due five hours early. Naive values (rows written
+        before `set_reminder` normalised) are read as UTC here — `app.reminders` reads
+        them in the configured zone instead, which is why it is the one the firing pass
+        uses and this is the general-purpose query.
+        """
+        now = _parse_iso(now_iso) if now_iso else datetime.now(timezone.utc)
+        if now is None:
+            return []
+        due = []
+        for row in self.undelivered_reminders():
+            when = _parse_iso(row["remind_at"])
+            if when is not None and when <= now:
+                due.append(row)
+        due.sort(key=lambda r: _parse_iso(r["remind_at"]) or now)
+        return due
+
+    def mark_reminder_fired(self, reminder_id: int, when: str | None = None) -> bool:
+        """Record that a reminder was handed to the delivery layer.
+
+        Distinct from completion: the user still has to actually do the thing. Only
+        fires once — the ``fired_at IS NULL`` guard is what stops a restart mid-pass
+        from re-announcing everything.
+        """
+        with self._lock:
+            cur = self._conn.execute(
+                "UPDATE reminders SET fired_at = ? WHERE id = ? AND fired_at IS NULL",
+                (when or _now(), reminder_id),
+            )
+            self._conn.commit()
+            return cur.rowcount > 0
 
     def complete_reminder(self, reminder_id: int) -> bool:
         """Mark a reminder done. Returns ``True`` if a pending one was updated."""
@@ -986,6 +1096,102 @@ class MemoryStore:
             )
             self._conn.commit()
             return cur.rowcount > 0
+
+    # --- the push outbox (see `app.push`) ---
+
+    def add_push(
+        self,
+        push_id: str,
+        kind: str,
+        text: str,
+        *,
+        title: str | None = None,
+        ref: dict | None = None,
+    ) -> str:
+        """Record one thing to say when someone is listening. Returns ``push_id``.
+
+        ``INSERT OR IGNORE`` so an enqueue retried with the same id is a no-op rather
+        than a duplicate announcement.
+        """
+        with self._lock:
+            self._conn.execute(
+                "INSERT OR IGNORE INTO push_outbox "
+                "(id, kind, text, title, ref, created_at, status) "
+                "VALUES (?, ?, ?, ?, ?, ?, 'pending')",
+                (
+                    push_id,
+                    kind,
+                    text.strip(),
+                    title,
+                    json.dumps(ref) if ref else None,
+                    _now(),
+                ),
+            )
+            self._conn.commit()
+        return push_id
+
+    def pending_pushes(self, limit: int = 50) -> list[dict]:
+        """Undelivered pushes, oldest first. ``ref`` comes back decoded."""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT id, kind, text, title, ref, created_at FROM push_outbox "
+                "WHERE status = 'pending' ORDER BY created_at ASC, rowid ASC LIMIT ?",
+                (max(1, limit),),
+            ).fetchall()
+        out: list[dict] = []
+        for row in rows:
+            item = dict(row)
+            raw = item.get("ref")
+            try:
+                item["ref"] = json.loads(raw) if raw else None
+            except (TypeError, ValueError):
+                item["ref"] = None
+            out.append(item)
+        return out
+
+    def mark_push_delivered(self, push_id: str) -> bool:
+        """Mark one push delivered. Returns ``True`` if it was still pending."""
+        with self._lock:
+            cur = self._conn.execute(
+                "UPDATE push_outbox SET status = 'delivered', delivered_at = ? "
+                "WHERE id = ? AND status = 'pending'",
+                (_now(), push_id),
+            )
+            self._conn.commit()
+            return cur.rowcount > 0
+
+    def get_push(self, push_id: str) -> dict | None:
+        """One push row by id, or ``None``. Used to resolve a ``push_ack``'s ``ref``."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT id, kind, text, title, ref, created_at, delivered_at, status "
+                "FROM push_outbox WHERE id = ?",
+                (push_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        item = dict(row)
+        try:
+            item["ref"] = json.loads(item["ref"]) if item["ref"] else None
+        except (TypeError, ValueError):
+            item["ref"] = None
+        return item
+
+    def expire_pushes(self, days: float) -> int:
+        """Retire pushes nobody ever collected, so the outbox can't grow forever.
+
+        A reminder from three weeks ago is not worth announcing when a client finally
+        reconnects; it is noise that would arrive as a burst.
+        """
+        cutoff = _iso_days_ago(days)
+        with self._lock:
+            cur = self._conn.execute(
+                "UPDATE push_outbox SET status = 'expired' "
+                "WHERE status = 'pending' AND created_at < ?",
+                (cutoff,),
+            )
+            self._conn.commit()
+            return cur.rowcount
 
     # --- telemetry ---
 

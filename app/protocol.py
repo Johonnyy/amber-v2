@@ -127,6 +127,70 @@ what a turn is actually doing instead of a spinner:
     ``audio_chunk`` as written-but-unspoken. Amber's own history has always recorded
     what was *streamed* rather than what was *heard*, so this matches what she thinks
     she said.
+
+**Everything above is a reply.** Every frame described so far answers something the
+client did — an utterance, a control frame, a tool result. Two additions break that,
+and they are the only frames in this protocol that Amber can originate.
+
+``push`` (server -> client) is Amber saying something unprompted: a reminder whose time
+arrived, a note the maintenance pass wrote, a build that finished somewhere else. It is
+the frame reminders were waiting on — they have always been recorded, listable and
+completable, and could never *fire*, because there was nowhere for a due reminder to go.
+
+  Three things make it different from every advisory frame above.
+
+  **It is durable, not best-effort.** ``memory``, ``activity``, ``delta`` and ``status``
+  describe a turn in progress, so a client that misses one has missed nothing that
+  outlives the turn. A reminder due at 17:30 while nothing is connected must still
+  arrive, so a push is written to an outbox first and delivered when a client exists.
+  Pending pushes are flushed on connect, right after the handshake.
+
+  **Delivery is at-least-once and ``id`` is stable.** If the socket takes the frame and
+  the process dies before the outbox is marked, the same ``id`` arrives again on the
+  next connect. A client must therefore key on ``id`` and ignore one it has already
+  seen, rather than assuming each frame is a new event. The alternative — at-most-once —
+  would mean silently losing exactly the reminders that matter.
+
+  **It never arrives mid-turn.** A push is held until the connection is idle. Not for
+  politeness: ``audio_chunk`` promises that the *next* binary frame is its sentence, and
+  a background task writing between those two sends would corrupt the audio stream for
+  every client. Waiting for the turn to end removes that hazard entirely rather than
+  narrowing it.
+
+  ``kind`` says what sort of thing this is (``reminder``, ``reflection``, ``notice``,
+  ``peer_event``) so a client can route it without parsing ``text``. ``ref`` carries the
+  row it came from — ``{"reminder_id": 12}`` — which is what lets an acknowledgment act
+  on the underlying thing rather than merely dismiss a card.
+
+``push_ack`` (client -> server) closes that loop: ``{"id", "action"}`` where ``action``
+is ``seen``, ``dismiss`` or ``complete``. ``complete`` on a reminder calls the *same*
+store function the ``complete_reminder`` tool calls, so a reminder completed by tapping
+and one completed by asking are the same row in the same state. A client that never
+sends it still gets every push exactly as before; the outbox is marked delivered on a
+successful send, not on the ack.
+
+Confirmation adds the last pair, and it is the one frame here a client genuinely owes an
+answer to. Amber has always been able to *describe* a risky action and never to ask
+permission for one, which is why no tool anywhere in the ecosystem could be marked
+``requires_confirmation``: the flag is enforced by `agent-mcp-py` against an
+``X-Confirmed`` header, and Amber had no way to obtain the approval that header asserts.
+Marking a tool would have made it permanently uncallable rather than safely gated.
+
+  * ``confirm_request`` (server -> client) — Amber is about to run a tool that declares
+    it needs human approval, and is blocked until an answer comes back. It carries the
+    correlation ``id``, the ``name``, the ``origin`` (the same ``ORIGIN_*`` vocabulary
+    ``activity`` uses, so a UI can say *Bloom wants to run a task* rather than printing a
+    raw tool name) and the ``input`` the model produced.
+  * ``confirm_response`` (client -> server) — ``{"id", "approved"}``.
+
+  **It fails closed.** No client connected, no answer within the timeout, or an explicit
+  denial are all the same outcome: the tool is not run and the model is told so, in a
+  string it can react to within the turn. Silence is never approval — which is why this
+  is a *request* like ``tool_call`` and emphatically not a report like ``activity``.
+
+  Unlike ``push``, this one does arrive mid-turn, and that is safe for the same reason
+  ``tool_call`` is: it is emitted from the task already driving the turn, which by
+  construction is not between an ``audio_chunk`` and its bytes while it waits on a tool.
 """
 
 from __future__ import annotations
@@ -142,6 +206,8 @@ SET_VOICE = "set_voice"  # patch how Amber sounds on this connection
 SET_MODEL = "set_model"  # pick this connection's brain, and/or re-point a keyword
 MEMORY_ACTION = "memory_action"  # forget / restore / correct one remembered fact
 MEMORY_QUERY = "memory_query"  # browse or search everything Amber remembers
+PUSH_ACK = "push_ack"  # acknowledge (and optionally act on) a delivered push
+CONFIRM_RESPONSE = "confirm_response"  # approve or deny a confirm_request
 
 # --- server -> client message types ---
 READY = "ready"  # handshake accepted; server is listening
@@ -156,7 +222,22 @@ MODEL = "model"  # the brain in effect, and the keyword catalogue behind it
 ACTIVITY = "activity"  # a tool call starting or finishing (advisory; see the docstring)
 DELTA = "delta"  # raw reply text as generated, for rendering (advisory)
 STATUS = "status"  # what this install can reach and what it has spent (advisory)
+PUSH = "push"  # Amber, unprompted: a reminder fired, a note, something finished
+CONFIRM_REQUEST = "confirm_request"  # may I run this? blocks until answered
 ERROR = "error"  # something went wrong this turn
+
+# --- ``push.kind``: what sort of unprompted thing this is ---
+# A client routes on this rather than parsing ``text``, so a reminder can ring and a
+# reflection can sit quietly in a panel without either having to be recognised by shape.
+PUSH_REMINDER = "reminder"  # a reminder whose time arrived
+PUSH_REFLECTION = "reflection"  # a note the maintenance pass wrote about how it's going
+PUSH_NOTICE = "notice"  # generic, from another service via POST /push
+PUSH_PEER_EVENT = "peer_event"  # something finished at a peer (a Bloom build, say)
+
+# --- ``push_ack.action`` ---
+ACK_SEEN = "seen"  # delivered and read; no state change
+ACK_DISMISS = "dismiss"  # the user waved it away
+ACK_COMPLETE = "complete"  # the user did the thing — acts on ``ref``
 
 # --- the two phases of an ``activity`` frame ---
 PHASE_START = "start"
@@ -426,6 +507,63 @@ def model(
         frame["options"] = dict(options)
     if locked:
         frame["locked"] = True
+    return frame
+
+
+def push(
+    push_id: str,
+    kind: str,
+    text: str,
+    *,
+    created_at: str | None = None,
+    ref: dict[str, Any] | None = None,
+    title: str | None = None,
+) -> dict[str, Any]:
+    """Amber, unprompted — the only server-originated frame in this protocol.
+
+    ``push_id`` is stable across redeliveries, which is the whole contract: delivery is
+    at-least-once, so a client keys on it and ignores a repeat. ``kind`` is one of the
+    ``PUSH_*`` constants. ``ref`` points at the row this came from (``{"reminder_id":
+    12}``), so a ``push_ack`` can act on the underlying thing instead of only dismissing
+    a card.
+
+    Never sent while a turn is in flight — see the module docstring for why that is a
+    correctness rule about the audio stream and not a matter of taste.
+    """
+    frame: dict[str, Any] = {"type": PUSH, "id": push_id, "kind": kind, "text": text}
+    if title:
+        frame["title"] = title
+    if created_at:
+        frame["created_at"] = created_at
+    if ref:
+        frame["ref"] = dict(ref)
+    return frame
+
+
+def confirm_request(
+    call_id: str,
+    name: str,
+    *,
+    origin: str,
+    tool_input: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Ask the human whether Amber may run this tool. Blocks the turn until answered.
+
+    A *request*, like ``tool_call`` and unlike ``activity`` — the client owes exactly one
+    ``confirm_response`` carrying this ``call_id``. If none arrives before the timeout the
+    call is refused, because silence must never read as approval.
+
+    ``origin`` is the ``ORIGIN_*`` vocabulary ``activity`` already uses, so a UI can name
+    who is asking rather than printing a prefixed tool name at someone.
+    """
+    frame: dict[str, Any] = {
+        "type": CONFIRM_REQUEST,
+        "id": call_id,
+        "name": name,
+        "origin": origin,
+    }
+    if tool_input is not None:
+        frame["input"] = tool_input
     return frame
 
 

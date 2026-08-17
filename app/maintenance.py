@@ -36,6 +36,7 @@ import logging
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 
+from app import protocol, push
 from app.config import Settings, get_settings
 from app.memory.store import (
     SOURCE_CONSOLIDATED,
@@ -260,6 +261,22 @@ async def _self_review(
             )
             if written is not None:
                 report.reflections += 1
+                # Surface it. These notes have always been written and never seen —
+                # `amber://memory/reflections` is reachable only by an agent holding an
+                # MCP key, so the one audience who might act on "replies are running
+                # long" was the one audience that could not read them.
+                #
+                # Surfacing, not injecting: `AMBER_FEATURE_SELF_NOTES` still governs
+                # whether a reflection reaches the *prompt*, and it stays off by
+                # default. That flag is the line between Amber noticing a pattern and
+                # Amber editing her own instructions, and showing someone a note does
+                # not cross it.
+                if push.enabled(settings):
+                    await push.enqueue(
+                        protocol.PUSH_REFLECTION,
+                        note.strip(),
+                        ref={"reflection_id": written},
+                    )
 
 
 async def run_maintenance(

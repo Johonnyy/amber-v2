@@ -74,6 +74,7 @@ from agent_runtime import Settings as RuntimeSettings
 from agent_mcp.registry import load_static_peers
 
 from app import activity as activity_stream
+from app import confirm
 from app import peers as peer_discovery
 from app.config import Settings, get_settings
 from app.models import resolve as resolve_model
@@ -83,6 +84,7 @@ from app.tools import get_tool_schemas, run_tool
 if TYPE_CHECKING:
     from app.activity import SendJson
     from app.client_tools import ClientTools
+    from app.confirm import Confirmations
     from app.turn_signals import TurnSignals
 
 logger = logging.getLogger(__name__)
@@ -156,6 +158,7 @@ def build_broker(
     client_tools: "ClientTools | None" = None,
     signals: "TurnSignals | None" = None,
     activity: "SendJson | None" = None,
+    confirmations: "Confirmations | None" = None,
 ):
     """Assemble this turn's tool broker, or ``None`` when there is nothing to offer.
 
@@ -167,6 +170,12 @@ def build_broker(
     reported to the client as it happens. The wrap goes *outside* everything rather
     than around each broker individually, which is the only position that sees all
     four classes of tool — and the only one that stays correct when a broker is added.
+
+    ``confirmations`` is that connection's approval channel (`app.confirm`), and its
+    wrap goes *inside* the activity one. That ordering is deliberate: a call refused for
+    want of approval should still appear as a tool call that started and failed, rather
+    than vanishing from the client's view entirely — a denial is the most interesting
+    thing that can happen in a turn, and it is the one a UI most needs to show.
     """
     settings = settings or get_settings()
     brokers: list = []
@@ -228,6 +237,12 @@ def build_broker(
     # The same peer list the client was built from, so a call is classified against
     # what this turn could actually reach rather than a second, later lookup that
     # might disagree with it.
+    broker = confirm.wrap(
+        broker,
+        confirmations,
+        peers=tuple(peer_names),
+        enabled=settings.feature_confirmations,
+    )
     return activity_stream.wrap(
         broker,
         activity,
@@ -279,6 +294,7 @@ async def think(
     conversation_id: str | None = None,
     model: str | None = None,
     activity: "SendJson | None" = None,
+    confirmations: "Confirmations | None" = None,
     state: RunState | None = None,
 ) -> AsyncIterator[str]:
     """Stream Amber's reply for the given conversation history.
@@ -306,6 +322,11 @@ async def think(
     calls are reported to the client as they happen. It changes nothing about what
     this function yields.
 
+    ``confirmations`` is the connection's approval channel, threaded the same way, so a
+    tool declaring ``requires_confirmation`` asks the human before it runs. Also
+    invisible in this stream: an unapproved call comes back as an error string the model
+    reads like any other, so it can say what it needs rather than silently doing nothing.
+
     ``state`` collects each step's model, tokens, cost and timings. Supply one and
     hand it to `record_spend` once this generator has drained — see the note at the
     call site for why the caller owns that rather than this function.
@@ -322,6 +343,7 @@ async def think(
         client_tools=client_tools,
         signals=signals,
         activity=activity,
+        confirmations=confirmations,
     )
 
     keyword = model or settings.llm_tier

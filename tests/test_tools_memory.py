@@ -153,7 +153,10 @@ async def test_reminders_can_be_listed_and_cleared(store):
 
     listed = await list_reminders()
     assert f"#{rid}: call mom" in listed
-    assert "2026-06-22T17:30:00" in listed
+    # Read back in words and in the user's own zone — the model speaks this aloud, and
+    # the column holds UTC now that reminders actually fire.
+    assert "June 22" in listed
+    assert "5:30 PM" in listed
 
     assert await complete_reminder(rid) == f"Cleared reminder #{rid}."
     assert "no pending reminders" in (await list_reminders()).lower()

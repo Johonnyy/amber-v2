@@ -310,6 +310,51 @@ class Settings(BaseSettings):
     # always existed, so off leaves memory curatable by asking but not by clicking.
     # Deletion is soft either way, so a mistake here is recoverable.
     feature_memory_control: bool = True
+    # When true, Amber can speak first: the ``push`` frame plus the durable outbox
+    # behind it (app/push.py). This is the only server-*initiated* frame in the
+    # protocol, and everything unprompted rides it — a fired reminder, a maintenance
+    # note, a build that finished elsewhere. Off means pushes are still recorded but
+    # never delivered, which is exactly how every client behaved before it existed.
+    feature_push: bool = True
+    # When true, a reminder whose time has arrived is handed to the push layer
+    # (app/reminders.py). Needs `feature_push` and `feature_memory` — with either off,
+    # reminders are still recorded, listed and completed, they simply never fire, which
+    # was the only behaviour available until this landed.
+    feature_reminder_delivery: bool = True
+    # When true, a tool declaring `requires_confirmation` asks the connected human
+    # before it runs (the ``confirm_request`` / ``confirm_response`` pair). It fails
+    # closed: no client, no answer, or a denial all refuse the call.
+    #
+    # Off removes the gate entirely — `app.confirm.wrap` hands the broker back
+    # unwrapped, so `update_server` runs the moment the model asks for it, with nothing
+    # in the log to say a gate was skipped. That is the behaviour that existed before
+    # this landed, and it is why the flag is worth being explicit about rather than a
+    # convenience.
+    feature_confirmations: bool = True
+
+    # --- Push delivery (app/push.py) ---
+    # How often the deliverer looks for undelivered pushes. Cheap: a SELECT against a
+    # tiny table, skipped entirely when nothing is connected.
+    push_interval_s: float = 15.0
+    # Pushes nobody ever collected are retired after this long, so a client that has
+    # been away for a month doesn't reconnect to a burst of stale reminders.
+    push_keep_days: float = 14.0
+    # How many pushes may go out in one delivery pass, so a backlog arrives in
+    # digestible batches rather than all at once.
+    push_batch: int = 20
+
+    # --- Reminder firing (app/reminders.py) ---
+    # Deliberately far tighter than the maintenance loop's six hours: a reminder is
+    # only useful near its time. Floored in the loop so a misconfiguration can't spin.
+    reminder_interval_s: float = 30.0
+    # Short, unlike maintenance's 300s — that delay exists to keep the test suite off
+    # the real database, and `tests/conftest.py` already disables background work.
+    reminder_startup_delay_s: float = 5.0
+
+    # How long Amber waits for a human to approve a gated tool call before refusing
+    # it. Longer than `client_tool_timeout_s`, because a person is slower than a
+    # device — but bounded, since the turn is blocked for the whole window.
+    confirm_timeout_s: float = 60.0
 
     # --- Amber's own MCP server ---
     # Comma-separated bearer tokens other agents present to query Amber, each

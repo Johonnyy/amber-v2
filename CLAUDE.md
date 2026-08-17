@@ -321,6 +321,73 @@ closing, so the socket may be gone, and it sits between the user interrupting an
 Amber listening again. A call still open at `turn_complete` is an interrupted call,
 and the client already knows because it sent the `interrupt`.
 
+**Amber can speak first now, and that was one gap wearing four masks.** Every frame
+above is a *reply* — the whole protocol was request/response per utterance, and there
+was no way for the server to originate anything. That single structural fact was the
+shared root of four separately-half-built features: reminders that could be recorded,
+listed and completed but never *fire*; `requires_confirmation` unusable ecosystem-wide
+because `X-Confirmed` had no source; maintenance reflections written every cycle and
+readable only by an agent holding an MCP key; and a Bloom build finishing on another
+tab in silence.
+
+`push` ([app/push.py](app/push.py)) is that direction. Three things separate it from
+every advisory frame above. It is **durable** — a SQLite outbox, not a queue, because
+a reminder due while nothing is connected is precisely the case that must survive, and
+Amber restarts on every deploy. Delivery is therefore **at-least-once with a stable
+`id`**: the row is marked *after* a successful send, so a crash in between redelivers
+rather than loses, and the client dedupes. And it **never lands mid-turn** — that is a
+correctness rule, not politeness. The pipeline sends an `audio_chunk` and then the
+bytes it describes, with an `await` boundary between them; a background task writing
+there would corrupt the audio stream for every client. A lock per send does *not* fix
+it (the pusher takes the lock in the gap), so the deliverer waits for the connection
+to be idle instead, which removes the hazard rather than narrowing it. In-turn writers
+— `activity`, `delta`, `confirm_request` — are safe by construction because they run on
+the task already driving the turn.
+
+The sink registry generalises `session.client_tools.bind(send_json)`, which was the
+only place a live connection was ever reachable from outside its own handler. Fan-out
+is honest about being single-user: a push goes to whoever is listening and is settled
+once any sink takes it. `POST /push` (authenticated with `AMBER_MCP_KEYS`) is how
+another service triggers one — the frame made delivery trivial, but nothing could
+*trigger* a "your build finished", since work completing inside a peer is invisible to
+Amber once the turn that started it ends. `reminder` is refused there: those are minted
+by the scheduler against a real row, and a forged one would put a reminder in front of
+the user with nothing behind it.
+
+**Reminders fire** ([app/reminders.py](app/reminders.py)), and making them fire exposed
+a bug that had never had the chance to be wrong out loud. `set_reminder` asks the model
+for local time "with no offset" and stored that string verbatim, while every other
+timestamp is UTC — so `due_reminders`' lexical comparison mis-fired by the length of
+the user's offset, six hours early in Denver. A trailing `Z` was also accepted and kept,
+so the column held two conventions at once. Times are normalised to an aware instant on
+write now, and the scheduler compares *instants* in Python rather than trusting SQL,
+because pre-existing naive rows are still in the database. `fired_at` (migration `_m8`)
+keeps delivery distinct from completion: a reminder that was announced and not acted on
+is still pending, and collapsing those would mean announcing it ticked it off.
+
+**`confirm_request` / `confirm_response`** ([app/confirm.py](app/confirm.py)) is the
+approval source. `agent-mcp-py` always enforced `requires_confirmation` and
+`agent-runtime` always published it on every tool schema, local and peer alike; what was
+missing was anything that could honestly produce the header, which is why marking a tool
+would have made it *permanently uncallable* rather than safely gated. `Confirmations`
+lives on the `Session` for the same reason `ClientTools` does — the receive loop has the
+session, so an answer can find the call blocked on it — and `ConfirmBroker` wraps the
+composite *inside* the activity wrap, so a denied call still renders as a tool call that
+failed instead of vanishing. It **fails closed**: no client, no answer, or a denial all
+refuse, and the three are reported distinctly because the model should re-ask after
+silence and drop it after a no.
+
+One trap is worth remembering: `MCPClient.bind` is **run-scoped** and sets conversation
+id, depth and confirmed together, so binding `confirmed=True` alone silently detaches
+the call from its conversation and zeroes the depth guard. `ConfirmBroker` records what
+it was bound with and re-binds the whole set around the approved call. That is safe only
+because the runner executes tool calls sequentially and Amber rebuilds the broker per
+turn — both verified, and both worth re-checking if `agent-runtime` ever parallelises
+tool execution. `update_server` is the first tool marked, and the obvious one: it runs a
+shell command and restarts the process serving the conversation that asked for it.
+Amber's *own* MCP tools stay unmarked deliberately — that file gates the **inbound**
+direction, whose approval source is the caller's own header, not this frame.
+
 **Both voice and model controls are still client-driven only — this is the open gap
 against design principle 3.** `set_voice` and `set_model` are frames a *client* sends; Amber has no
 tool that reaches them, so "can you talk slower?" today produces a sentence about
@@ -694,11 +761,14 @@ All three changes landed, and the voice loop and WS protocol are untouched:
 * **`conversation_id` is the session id**, threaded from `main.py` through
   `run_turn` into the brain, so model spend and tool calls are attributable to a
   session and any peer call joins the same exchange.
-* **`X-Confirmed` still has no source.** `app/protocol.py` has 8 server frame types
-  and no tool-event frame, so a human cannot approve anything yet. Amber's MCP tools
-  are therefore *not* marked `requires_confirmation`: the two mutating ones are
-  trivially reversible, and marking them would make them permanently uncallable
-  rather than safely gated. Revisit when that additive frame lands.
+* **`X-Confirmed` has a source now** — `confirm_request` / `confirm_response`, see
+  [app/confirm.py](app/confirm.py). It gates the **outbound** direction: Amber asking
+  before *she* calls a tool that declares `requires_confirmation`. Amber's own MCP
+  tools stay unmarked, and that is a distinction rather than an oversight — that file
+  is the **inbound** direction, where the approval source is the calling agent's own
+  header, not this frame. Marking `add_task` there would pop a dialog on a possibly
+  absent human on behalf of a peer, and both mutating tools remain trivially
+  reversible.
 * **`app/sentence_splitter.py` is now duplicated** by `agent_runtime.streaming`.
   Verified behaviourally identical across abbreviations, decimals and ellipsis, so
   Amber's copy could delegate — left alone deliberately, to keep this refactor's
@@ -712,26 +782,40 @@ All three changes landed, and the voice loop and WS protocol are untouched:
   `read_url`, telemetry, and the unattended maintenance pass), plus per-connection
   voice and model control with a keyword table shared through the sync store, and
   ecosystem self-knowledge in the prompt. Voice pipeline complete, streaming seam
-  intact, 473 tests in `tests/`. Runs on `agent-runtime` and serves her own MCP
+  intact, 613 tests in `tests/`. Runs on `agent-runtime` and serves her own MCP
   server, and resolves peers through the registry as well as the env map
   ([app/peers.py](app/peers.py)).
-  - **Not yet done here:** reminders still can't *fire* — they're recorded,
-    listable and completable, but delivery needs a server-initiated protocol frame.
-    The maintenance scheduler makes that a small follow-on. Long-term memory as
-    markdown files is a future phase; the fact tiering is its on-ramp
-    (`durable` + `category` + provenance export cleanly to one file per fact).
-  - **Also not done: Amber can't drive her own settings.** `app/tools/` has no
+  - **New: Amber can speak first.** The protocol had no server-initiated frame at
+    all, and that one absence was blocking four things at once. `push` +
+    a durable outbox ([app/push.py](app/push.py), migration `_m7`) is the direction;
+    **reminders now fire** ([app/reminders.py](app/reminders.py), `_m8` adds
+    `fired_at`), reflections surface instead of sitting unread, and `POST /push` lets
+    any ecosystem service put something in front of the user. `confirm_request` /
+    `confirm_response` ([app/confirm.py](app/confirm.py)) is the `X-Confirmed` source
+    that was missing, so `requires_confirmation` is usable **outbound across the whole
+    ecosystem** — which is what lets Bloom gate `run_task`. `update_server` is the
+    first tool marked. 613 tests. See the client protocol section for the three rules
+    that hold `push` together (durable, at-least-once, never mid-turn).
+  - **Fixed on the way past, and it would have been wrong every time:** a reminder's
+    `remind_at` was stored exactly as the model wrote it — local time with no offset,
+    per the tool's own description — while everything else in the database is UTC. It
+    had never mattered because nothing ever compared them. `due_reminders` did, so
+    every reminder would have fired early by the user's offset.
+  - **Not yet done here:** long-term memory as markdown files is a future phase; the
+    fact tiering is its on-ramp (`durable` + `category` + provenance export cleanly to
+    one file per fact).
+  - **Still not done: Amber can't drive her own settings.** `app/tools/` has no
     voice or model tool, so the per-connection controls are reachable by a client
     frame and not by asking. This is now the highest-value gap in the repo, because
     it is the concrete instance of design principle 3 — see the note in the client
     protocol section for the shape of the fix.
-  - **New: the turn is observable.** `activity` and `delta` frames
+  - **The turn is observable.** `activity` and `delta` frames
     ([app/protocol.py](app/protocol.py), [app/activity.py](app/activity.py)), a
     `status` frame carrying peers/sync/features ([app/status.py](app/status.py)),
     and client-driven memory curation — `memory_action` / `memory_query`
     ([app/memory_control.py](app/memory_control.py)) landing on the *same* store
     functions the `forget_fact` / `correct_fact` tools call, so a fact forgotten by
-    asking and one forgotten by clicking are the same row. 527 tests.
+    asking and one forgotten by clicking are the same row.
   - **Fixed, and it had never worked:** `AgentRunner.stream` built its bookkeeping
     state inline and discarded it, and the recording step was reachable only from
     `run()` — which Amber never calls. So every voice turn threw away its model,
@@ -754,11 +838,42 @@ All three changes landed, and the voice loop and WS protocol are untouched:
   once makes it available to every agent. It can also build one from a description
   ("a Spotify agent that can play and search music"), researching the service and
   preferring an existing MCP server to an integration it would have to carry. Two
-  surfaces with deliberately separate key sets: `/mcp` (`run_task`, `build_agent`) is
-  how Amber and other agents reach it, `/admin/*` is plain REST because Aperture
-  wants an OpenAPI schema, and a GUI that edits config shouldn't hold a token that
-  spends money. Adding a capability is a row in a table, not a repo and a deploy —
-  which is what makes design principle 4 affordable.
+  surfaces with deliberately separate key sets: `/mcp` (`run_task`, `build_agent`,
+  `edit_agent`) is how Amber and other agents reach it, `/admin/*` is plain REST
+  because Aperture wants an OpenAPI schema, and a GUI that edits config shouldn't
+  hold a token that spends money. Adding a capability is a row in a table, not a repo
+  and a deploy — which is what makes design principle 4 affordable.
+  - **It writes its own provider manifests now.** A provider — the definition of how
+    to reach one service's API with a credential — used to be a TOML file in Bloom's
+    code tree, which made "connect Google Analytics" a pull request and a redeploy.
+    There is no version of *ship a manifest for every OAuth service* that scales, and
+    it contradicted the premise that a capability is a row in a table. The builder
+    researches the API from its own documentation and writes the manifest at runtime;
+    it lives in `bloom.db`, not the repo, and travels through the sync store's
+    `/manifests` so one install's research is not repeated on the next. Two files
+    remain in `app/providers/` as reference implementations and always beat a stored
+    row of the same name. The trade is real and priced rather than waved away: a
+    manifest defines HTTP calls made with a live credential, so endpoints must be
+    public https (a manifest naming `169.254.169.254` would point the credential
+    resolver at the instance's own metadata service), `DELETE` is refused outright,
+    and — since the reviewing human was the thing given up — the connection screen now
+    says who wrote the definition and **which hosts the credential will be sent to**,
+    which is a fact someone can actually check. `PUT /admin/manifests/{name}` is the
+    acceptance criterion rather than a nicety: a wrong operation is fixed in a form,
+    because fixing it in an editor would have traded one code-editor trip for another.
+    `docs/provider-manifests-future.md` in Bloom is the full accounting.
+  - **It edits as well as builds** (`edit_agent`, `POST /admin/builder/edit`, and the
+    matching builder tools). It could only create, which made "give the Spotify agent
+    permission to skip" unanswerable — the only offer available was a rebuild, and a
+    rebuilt agent attached to the same connection inherits the same OAuth grant. **A
+    permission is a property of the connection, not of the agent**; both the tool
+    descriptions and the builder's prompt name the rebuild as the wrong move, because
+    it is what a model reaches for unprompted. Widening a scope still cannot be
+    finished headlessly — a provider grants scopes when a person approves them — so
+    an edit hands back an authorisation link and a `connect_oauth` step, and settles
+    `needs_setup` rather than claiming a permission is live. The builder is refused
+    its own slug on every write path, which is the lock that had been implicit while
+    it could only create.
 - **notification-relay**: not yet built.
 - **Hosted sync store**: **built**, in `amber-infra/sync-store` — the server registry,
   Aperture's config blobs, and (new) the shared model-keyword table at `/models`.
@@ -802,6 +917,16 @@ All three changes landed, and the voice loop and WS protocol are untouched:
     confidence and use count with a one-click forget and a real undo — Amber's delete
     is soft, so restoring brings back the same row. Resizable, and sections narrow
     themselves per view rather than sitting open and empty.
+  - **It receives what Amber says unprompted.** `PushFrame` and `ConfirmRequestFrame`
+    in `src/shared/protocol.ts`, a `PushTray` for the first and a modal `ConfirmDialog`
+    for the second — a modal because a `confirm_request` has a *turn* stopped behind
+    it, where a push does not. Two details are deliberate: pushes are deduped on `id`
+    (delivery is at-least-once), and the dialog focuses **Deny**, treats Escape as a
+    refusal, and shows no countdown — a timer would imply the safe outcome is the one
+    that needs hurrying, when it is the one that happens if you do nothing.
+    `verify:push` guards the frame gate, because a frame added to the `ServerFrame`
+    union and forgotten in `SERVER_FRAME_TYPES` is dropped at the socket with no error
+    anywhere — `protocol.ts` and `store.ts` had no verify script until now.
   - Still open: the terminal-only operations (principle 2), and the Amber-facing
     tools for the settings the UI can already write (principle 3).
 

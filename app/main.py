@@ -28,10 +28,18 @@ import json
 import logging
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from typing import Any
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, status
+from fastapi import (
+    FastAPI,
+    HTTPException,
+    Request,
+    WebSocket,
+    WebSocketDisconnect,
+    status,
+)
 
-from app import memory_control, model_sync, models, peers, protocol, signals
+from app import memory_control, model_sync, models, peers, protocol, push, signals
 # Aliased: `fastapi.status` is already imported above for the WS close codes, and
 # these two would otherwise be one name meaning two things in the same module.
 from app import status as status_report
@@ -81,6 +89,21 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         # re-pointed elsewhere while this box was down is in effect for the first
         # turn after a restart rather than five minutes into it.
         background.append(asyncio.create_task(model_sync.sync_loop(settings)))
+    if push.enabled(settings):
+        # The one loop that writes to a socket nobody asked to be written to. It only
+        # ever targets an *idle* connection — see app/push.py for why that is a
+        # correctness rule about the audio stream rather than good manners.
+        background.append(asyncio.create_task(push.get_deliverer().deliver_loop()))
+    if (
+        settings.feature_reminder_delivery
+        and settings.feature_memory
+        and push.enabled(settings)
+    ):
+        # Reminders have been recordable since Phase 4 and could never fire, because
+        # there was nowhere for a due one to go. This is the other half.
+        from app.reminders import reminder_loop
+
+        background.append(asyncio.create_task(reminder_loop(settings)))
     if peers.discovery_enabled(settings):
         # Peer discovery. Same shape and the same reason as the keyword sync above:
         # a peer connected from Aperture while this box was restarting should be
@@ -135,6 +158,71 @@ _mount_mcp(app, settings)
 async def health() -> dict[str, str]:
     """Liveness probe for systemd / load balancers."""
     return {"status": "ok", "service": "amber", "version": app.version}
+
+
+@app.post("/push")
+async def submit_push(request: Request) -> dict[str, Any]:
+    """Let another service in the ecosystem put something in front of the user.
+
+    This is how "your Bloom build finished" actually arrives. The frame and the outbox
+    make *delivery* trivial, but nothing else could ever **trigger** one: work that
+    completes inside a peer is invisible to Amber the moment the turn that started it
+    ends, and there is no polling loop that would notice.
+
+    Authenticated with `AMBER_MCP_KEYS` — the same credentials peers already hold, so
+    connecting a service that can notify is not a second thing to configure. No keys
+    means no endpoint, matching how the MCP server itself fails closed rather than
+    mounting wide open.
+
+    Deliberately not an MCP tool: the caller here is a *service* reporting an event, not
+    an agent taking a turn, and it should not need a session, a depth header, or a
+    conversation id to say one sentence.
+    """
+    settings = get_settings()
+    if not settings.mcp_server_enabled or not push.enabled(settings):
+        raise HTTPException(status_code=404, detail="Push is not enabled here.")
+
+    from agent_mcp.auth import parse_keys
+
+    # `parse_keys` returns token -> caller name, so the presented token is the key.
+    keys = parse_keys(settings.mcp_keys)
+    header = request.headers.get("authorization", "")
+    token = header[7:].strip() if header.lower().startswith("bearer ") else ""
+    caller = keys.get(token) if token else None
+    if caller is None:
+        raise HTTPException(status_code=401, detail="Bad or missing bearer token.")
+
+    try:
+        payload = await request.json()
+    except Exception:  # noqa: BLE001
+        raise HTTPException(status_code=400, detail="Body must be JSON.") from None
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=400, detail="Body must be a JSON object.")
+
+    text = payload.get("text")
+    if not isinstance(text, str) or not text.strip():
+        raise HTTPException(status_code=400, detail="'text' is required.")
+    kind = payload.get("kind")
+    if kind not in _PUSH_KINDS:
+        kind = protocol.PUSH_NOTICE
+    ref = payload.get("ref") if isinstance(payload.get("ref"), dict) else None
+    title = payload.get("title") if isinstance(payload.get("title"), str) else None
+
+    push_id = await push.enqueue(kind, text, ref=ref, title=title)
+    if push_id is None:
+        raise HTTPException(status_code=500, detail="Could not record the push.")
+    logger.info("Push accepted from %s: %s", caller, kind)
+    # ``queued``, not ``delivered`` — there may be nobody connected, and saying
+    # otherwise would be a lie the outbox exists precisely to avoid telling.
+    return {"id": push_id, "status": "queued", "listeners": push.get_deliverer().live()}
+
+
+#: Kinds an external caller may claim. ``reminder`` is deliberately absent: those are
+#: Amber's own, minted by the scheduler against a real row, and letting a peer forge one
+#: would put a reminder in front of the user that no reminder exists behind.
+_PUSH_KINDS = frozenset(
+    {protocol.PUSH_NOTICE, protocol.PUSH_PEER_EVENT, protocol.PUSH_REFLECTION}
+)
 
 
 def _authorized(websocket: WebSocket, settings: Settings) -> bool:
@@ -198,6 +286,13 @@ async def voice_socket(websocket: WebSocket) -> None:
     # Attach this connection's send channel so client-declared tools can be called
     # back over the socket. Detached again in the finally below.
     session.client_tools.bind(send_json)
+    # Identifies *this connection* within a session that can outlive it. A resumed
+    # session (`?session_id=`) binds a new socket while the old handler may still be
+    # unwinding, and without this its `finally` would detach the one that just arrived.
+    connection = object()
+    # Same for approval requests: the broker asks over this socket and the receive loop
+    # below resolves the answer, exactly as it does for a client tool result.
+    session.confirmations.bind(send_json, token=connection)
 
     current_turn: asyncio.Task | None = None
 
@@ -234,6 +329,24 @@ async def voice_socket(websocket: WebSocket) -> None:
             _guarded_turn(audio, send_json, send_bytes, session, text=text)
         )
 
+    # Anything Amber wanted to say while this client was away. Bound only now, after
+    # the handshake, so a push can never arrive before ``ready``.
+    #
+    # `is_idle` is the deferral gate: the deliverer skips a connection with a turn in
+    # flight, because a frame written between an ``audio_chunk`` and its bytes would
+    # corrupt the audio stream. See app/push.py.
+    push.get_deliverer().bind(
+        session.id,
+        send_json,
+        lambda: current_turn is None or current_turn.done(),
+        token=connection,
+    )
+    # Deliberately *conditional* — nothing is sent when the outbox is empty, so the
+    # handshake remains exactly four frames for every client (and every test) that has
+    # nothing waiting.
+    with contextlib.suppress(Exception):
+        await push.get_deliverer().flush(session_id=session.id)
+
     try:
         while True:
             message = await websocket.receive()
@@ -261,6 +374,14 @@ async def voice_socket(websocket: WebSocket) -> None:
         # Detach the send channel and fail any in-flight client tool calls; the
         # declared tool specs are kept so a reconnect with this id still has them.
         session.client_tools.unbind()
+        # Any approval still being waited on dies with the socket — which is the right
+        # answer, since confirmation fails closed and there is no longer a human here.
+        # Both by token: a reconnect that has already resumed this session must not be
+        # torn down by the socket it replaced.
+        session.confirmations.unbind(token=connection)
+        # Stop the deliverer writing to a socket that has gone. Undelivered pushes stay
+        # pending and arrive on the next connect; that is what the outbox is for.
+        push.get_deliverer().unbind(session.id, token=connection)
         # Don't drop the session: keep it warm so a reconnect with this id resumes.
         # The manager's TTL reclaims it if the client never comes back.
         manager.touch(session)
@@ -417,6 +538,20 @@ async def _handle_control(
             payload.get("content", ""),
             bool(payload.get("is_error")),
         )
+    elif kind == protocol.PUSH_ACK:
+        # Settles the outbox row, and — for ``complete`` — acts on what the push
+        # referred to, landing on the same store function the matching tool calls.
+        if not push.enabled(settings):
+            logger.debug("[%s] Ignoring push_ack (push disabled)", session.id)
+            return
+        try:
+            await push.acknowledge(payload)
+        except Exception:  # noqa: BLE001 — an ack is never worth the socket
+            logger.exception("[%s] push_ack failed", session.id)
+    elif kind == protocol.CONFIRM_RESPONSE:
+        # The human's answer to a blocked tool call. Unknown or late ids are dropped,
+        # like any other correlation-keyed result.
+        session.confirmations.resolve(payload.get("id"), bool(payload.get("approved")))
     elif kind in (protocol.MEMORY_ACTION, protocol.MEMORY_QUERY):
         # Curating memory from the UI, landing on the same store functions Amber's
         # own `forget_fact` / `correct_fact` tools call. Two ways in, one code path —
@@ -486,6 +621,8 @@ async def _guarded_turn(
             # Same discipline for the brain: switching model mid-reply would answer
             # the second half of a question with a different model than the first.
             model=session.model_keyword,
+            # Bound to this socket, so a gated tool can ask the person actually here.
+            confirmations=session.confirmations,
         )
     except asyncio.CancelledError:
         raise  # interrupt/barge-in — expected, let it unwind

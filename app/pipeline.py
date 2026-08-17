@@ -49,6 +49,7 @@ from app.voice import VoiceSettings
 
 if TYPE_CHECKING:
     from app.client_tools import ClientTools
+    from app.confirm import Confirmations
 
 logger = logging.getLogger(__name__)
 
@@ -73,6 +74,7 @@ async def run_turn(
     text: str | None = None,
     voice: VoiceSettings | None = None,
     model: str | None = None,
+    confirmations: "Confirmations | None" = None,
 ) -> int:
     """Process one user turn and stream the spoken reply back.
 
@@ -141,6 +143,7 @@ async def run_turn(
                 conversation_id=conversation_id,
                 voice=voice,
                 model=model,
+                confirmations=confirmations,
                 # A typed turn reads on a screen; a spoken one is heard. Same words,
                 # different register — see `app.persona`.
                 modality="text" if text is not None else "voice",
@@ -201,6 +204,7 @@ async def _think_and_speak(
     modality: str = "voice",
     voice: VoiceSettings | None = None,
     model: str | None = None,
+    confirmations: "Confirmations | None" = None,
 ) -> tuple[int, str, bool, list[int]]:
     """Record the user turn, stream a reply, and record what was spoken.
 
@@ -263,6 +267,10 @@ async def _think_and_speak(
             # the broker, which runs on this very task — so they interleave with
             # `audio_chunk` in true order without a queue or a lock.
             activity=send_json if settings.feature_activity_stream else None,
+            # The approval channel for tools that declare they need one. Bound to the
+            # socket rather than passed as a sink, because the *answer* arrives on the
+            # receive loop and has to find the call that is blocked on it.
+            confirmations=confirmations,
             # Collects each step's model, tokens, cost and timings — recorded below,
             # after the reply is out. See `brain.record_spend`.
             state=state,

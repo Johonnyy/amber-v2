@@ -125,6 +125,17 @@ def _features(settings: Settings) -> dict[str, bool]:
         "maintenance": settings.feature_maintenance,
         "activity_stream": settings.feature_activity_stream,
         "text_stream": settings.feature_text_stream,
+        # Whether Amber can speak first at all, and whether reminders will ever arrive.
+        # A client cannot infer either: with push off, a reminder is still accepted and
+        # still listed, and the only symptom is that it never turns up.
+        "push": settings.feature_push,
+        "reminder_delivery": (
+            settings.feature_reminder_delivery
+            and settings.feature_memory
+            and settings.feature_push
+        ),
+        # Whether to build the approval dialog. With this off, a gated tool simply runs.
+        "confirmations": settings.feature_confirmations,
         "mcp_server": settings.mcp_server_enabled,
         "peer_discovery": peer_discovery.discovery_enabled(settings),
         "model_sync": model_sync.sync_enabled(settings),

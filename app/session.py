@@ -31,6 +31,7 @@ from functools import lru_cache
 
 from app.client_tools import ClientTools
 from app.config import get_settings
+from app.confirm import Confirmations
 from app.ratelimit import RateLimiter
 from app.voice import VoiceSettings
 
@@ -80,6 +81,12 @@ class Session:
     # Tools this client declared it can run on its own device (see
     # app.client_tools). Persists across reconnect until the client re-declares.
     client_tools: ClientTools = field(default_factory=ClientTools)
+    # This connection's approval channel (see app.confirm). Lives here for the same
+    # reason `client_tools` does: the receive loop has the session, so it is the one
+    # place a `confirm_response` can be matched to the call that is blocked on it.
+    # Deliberately *not* retained across a reconnect in any meaningful sense — it holds
+    # no declared state, only in-flight questions, and those die with the socket.
+    confirmations: Confirmations = field(default_factory=Confirmations)
     # How Amber sounds to *this* client (see app.voice). Starts at the install
     # default and is replaced wholesale by a ``set_voice`` patch. Retained across a
     # reconnect like the tools above, so resuming a session doesn't reset the voice

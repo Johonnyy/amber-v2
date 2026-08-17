@@ -48,6 +48,18 @@ def _configured() -> bool:
     ),
     input_schema={"type": "object", "properties": {}},
     available=_configured,
+    # The first tool in Amber to require explicit approval, and the obvious one: it
+    # runs a shell command as a privileged user and restarts the process serving the
+    # conversation in which it was requested. `available` already gates it on being
+    # configured at all; this gates the individual call on a person saying yes.
+    #
+    # Being *asked* to update is not the same as approving it. A misheard sentence, a
+    # peer agent's suggestion, or a model that pattern-matched "redeploy" all reach
+    # this tool by exactly the same path, and none of them should be able to restart
+    # the server unattended. Confirmation fails closed, so with nobody connected this
+    # simply refuses — which is the correct answer for a self-restart nobody is
+    # watching.
+    requires_confirmation=True,
 )
 async def update_server() -> str:
     settings = get_settings()
