@@ -388,19 +388,58 @@ shell command and restarts the process serving the conversation that asked for i
 Amber's *own* MCP tools stay unmarked deliberately — that file gates the **inbound**
 direction, whose approval source is the caller's own header, not this frame.
 
-**Both voice and model controls are still client-driven only — this is the open gap
-against design principle 3.** `set_voice` and `set_model` are frames a *client* sends; Amber has no
-tool that reaches them, so "can you talk slower?" today produces a sentence about
-talking slower rather than a lower `speed`. The plumbing needed is small and already
-shaped for it: the settings live on the `Session`, are validated and clamped in one
-place (`app/voice.py`, `app/models.py`), and are read once per turn — so a registry
-tool that mutates the session's `VoiceSettings` lands on exactly the value the
-Settings page writes, and the existing `voice` / `model` frames already exist to echo
-the change back so the UI stays in sync. The one real design question is scope: a
-voice change is per-connection and cheap to undo, while a keyword *remap* is
-install-wide and persisted, so the second should be harder for a passing remark to
-trigger than the first. Until this lands, every new setting should be built with its
-Amber-facing tool from the start rather than repeating this gap.
+**Principle 3 is closed: Amber drives her own settings now.** "Can you talk slower?"
+lowers `speed` rather than producing a sentence about talking slower
+([app/knobs.py](app/knobs.py), `_knobs_broker` in [app/brain.py](app/brain.py)). The
+mechanics turned out to be free — `session.voice` and `session.model_keyword` are read
+exactly once per turn, into locals `run_turn` then holds frozen, so a tool that mutates
+the session **cannot** change the voice of sentence four. It lands on the next turn by
+construction.
+
+What was *not* free is reachability, and it is worth knowing why the obvious approach is
+impossible: the registry is process-wide, `dispatch` passes only the JSON the model
+produced, `available=` predicates take no arguments, and there is no contextvar anywhere
+in this codebase. A `@registry.register` tool cannot see its connection at all. So the
+tools are closures over a per-turn `Knobs` in their own `LocalToolBroker`, exactly the
+shape `_signal_broker` uses for `expect_reply`, threaded down the path `confirmations`
+already takes. Every method delegates to the code the *client frames* use —
+`VoiceSettings.patched`, `models.apply_map` — so asking and clicking are validated by
+the same lines and land on the same value.
+
+**The confirmation posture is the design point, not a detail.** `set_voice` and
+`set_brain` are per-connection and undone by saying so again. `remap_keyword` is
+install-wide, persisted to SQLite and pushed to the sync store, so a passing remark would
+change what `coding` means in *every app in the ecosystem* — it alone carries
+`requires_confirmation`, which is the approval pair's first real use beyond
+`update_server`. And the prompt gains a **settings block** naming the live values
+(`_settings_block`, interpolated like `_device_block`), because "slower" is unanswerable
+without knowing the current speed.
+
+**Everything above is a reply; three more frames are how you ask how she's *doing*.**
+`review_query` / `review` / `review_action` ([app/review.py](app/review.py)) share one
+trio shaped exactly like the memory one, covering three topics: per-tool reliability
+(p50/p95, nearest-rank, matching what `agent_mcp.usage_log` reports for its own table),
+the maintenance pass's self-review notes, and eval cases. All three read data Amber has
+always recorded and shown nobody. Reflections gain **promote** and **dismiss** —
+`reflections.dismissed` had existed since the table was created with no writer at all —
+and promotion is what makes `AMBER_FEATURE_SELF_NOTES` safe to leave off: the note
+becomes an ordinary durable fact because *a person chose to keep it*, not because the
+model edited its own instructions. `eval_capture` saves a turn that went wrong, carrying
+the whole case rather than a pointer into the exchange log, since that table has no
+session id and pairs user with assistant positionally.
+
+**A turn now says where its seconds went.** `turn_complete` carries `timings`
+([app/timings.py](app/timings.py)) and `step_spans`. Two `perf_counter` pairs are the
+whole addition — per-step model times have always been on `RunState.steps` and `_stats`
+threw them away. Deliberately **no `tools_ms`**: every tool call already arrives as an
+`activity` pair carrying its own `ms`, and measuring it twice would be two sources for
+one number. On the way past, `signals.record(KIND_TURN, latency_ms=)` was hard-coded
+`None`, so no turn had ever recorded its own duration.
+
+The standing rule that came out of this: **every new setting ships with its
+Amber-facing tool in the same change.** The gap above existed for as long as it did
+because each control was built client-first and the tool was left as a follow-on that
+never came.
 
 **Typed turns.** `user_text` (`{"type": "user_text", "text": "..."}`) is the exact peer
 of a binary utterance: it takes a turn slot, obeys the same rate limit and session cap,
@@ -782,7 +821,7 @@ All three changes landed, and the voice loop and WS protocol are untouched:
   `read_url`, telemetry, and the unattended maintenance pass), plus per-connection
   voice and model control with a keyword table shared through the sync store, and
   ecosystem self-knowledge in the prompt. Voice pipeline complete, streaming seam
-  intact, 613 tests in `tests/`. Runs on `agent-runtime` and serves her own MCP
+  intact, 675 tests in `tests/`. Runs on `agent-runtime` and serves her own MCP
   server, and resolves peers through the registry as well as the env map
   ([app/peers.py](app/peers.py)).
   - **New: Amber can speak first.** The protocol had no server-initiated frame at
@@ -794,7 +833,7 @@ All three changes landed, and the voice loop and WS protocol are untouched:
     `confirm_response` ([app/confirm.py](app/confirm.py)) is the `X-Confirmed` source
     that was missing, so `requires_confirmation` is usable **outbound across the whole
     ecosystem** — which is what lets Bloom gate `run_task`. `update_server` is the
-    first tool marked. 613 tests. See the client protocol section for the three rules
+    first tool marked. See the client protocol section for the three rules
     that hold `push` together (durable, at-least-once, never mid-turn).
   - **Fixed on the way past, and it would have been wrong every time:** a reminder's
     `remind_at` was stored exactly as the model wrote it — local time with no offset,
@@ -804,11 +843,25 @@ All three changes landed, and the voice loop and WS protocol are untouched:
   - **Not yet done here:** long-term memory as markdown files is a future phase; the
     fact tiering is its on-ramp (`durable` + `category` + provenance export cleanly to
     one file per fact).
-  - **Still not done: Amber can't drive her own settings.** `app/tools/` has no
-    voice or model tool, so the per-connection controls are reachable by a client
-    frame and not by asking. This is now the highest-value gap in the repo, because
-    it is the concrete instance of design principle 3 — see the note in the client
-    protocol section for the shape of the fix.
+  - **Principle 3 is closed.** [app/knobs.py](app/knobs.py) gives Amber `set_voice`,
+    `set_brain` and `remap_keyword`, driving the *same* per-connection values the
+    Settings page writes. The asymmetry is the point: only the install-wide,
+    persisted, ecosystem-shared `remap_keyword` requires confirmation. The
+    reachability problem is worth reading before adding another such tool — the
+    process-wide registry genuinely cannot see a connection, so these live in a
+    closure-captured `LocalToolBroker`.
+  - **New: the data Amber had is finally visible.** A turn reports where its seconds
+    went ([app/timings.py](app/timings.py)); `review_query` / `review` /
+    `review_action` ([app/review.py](app/review.py)) surface per-tool reliability
+    with real percentiles, the self-review notes (now promotable into durable facts,
+    or dismissable — `reflections.dismissed` finally has a writer), and eval cases
+    captured from turns that misfired and replayed by
+    [app/evals.py](app/evals.py). `superseded_by` has been written on every
+    correction since tiering landed and read by **nothing**; `memory_query` gains
+    `scope: lineage | archive` so a fact's revision history and the archive of what
+    she no longer believes are both readable. `status` carries the memory *policy*,
+    so a client can say "forgotten in about 4 days unless used" without hardcoding
+    thresholds that go quietly wrong on a tuned install. 675 tests.
   - **The turn is observable.** `activity` and `delta` frames
     ([app/protocol.py](app/protocol.py), [app/activity.py](app/activity.py)), a
     `status` frame carrying peers/sync/features ([app/status.py](app/status.py)),
@@ -927,8 +980,18 @@ All three changes landed, and the voice loop and WS protocol are untouched:
     `verify:push` guards the frame gate, because a frame added to the `ServerFrame`
     union and forgotten in `SERVER_FRAME_TYPES` is dropped at the socket with no error
     anywhere — `protocol.ts` and `store.ts` had no verify script until now.
-  - Still open: the terminal-only operations (principle 2), and the Amber-facing
-    tools for the settings the UI can already write (principle 3).
+  - **The visual and intelligence passes landed.** A turn's latency renders as a
+    waterfall (`chat/turn-layout.ts`, guarded by `verify:waterfall`), the status
+    sidebar gains a **Health** section over the `review` frames, memory facts show a
+    decay countdown and a revision chain (`status/fact-lifecycle.ts`, guarded by
+    `verify:lifecycle` — three rules there would each produce a confident false
+    sentence if got wrong), `RegistryMap` lights an edge while Amber is calling that
+    peer (no new frame: `Activity.origin` is already `peer:<name>`), and a reply
+    carries a provenance row plus a **wrong?** button that saves it as an eval case.
+  - Still open: the terminal-only operations (principle 2). Durable provenance is the
+    other known gap — explaining *yesterday's* turn needs schema the exchange log
+    doesn't have (no session id, positional user/assistant pairing, and the fact ids
+    a turn used are discarded), so today's provenance is live-session only.
 
 ## Build order (current)
 

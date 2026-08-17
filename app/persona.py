@@ -123,6 +123,37 @@ def _device_block(client_tool_names: Sequence[str]) -> str | None:
     )
 
 
+def _settings_block(description: str | None) -> str | None:
+    """Name the voice and model actually in effect on this connection.
+
+    Interpolated from live state, for the same reason `_device_block` is: a prompt
+    that described these from memory would be wrong the moment one changed.
+
+    It exists because "talk slower" is unanswerable without knowing the current
+    speed — the model has to know it is at 1.15 to ask for 1.0. Without this the
+    tools are reachable but not usable, which is the half-built state the whole
+    principle is about.
+
+    The *guidance* lives here too rather than in `CORE`, and that placement is
+    load-bearing: this block is emitted only when the tools are actually offered, so
+    an install with `AMBER_FEATURE_SELF_SETTINGS` off never tells the model to call
+    something it will not be given.
+    """
+    if not description:
+        return None
+    return (
+        f"Right now you're {description}.\n"
+        "Both are yours to change when asked. The split is between *this once* and "
+        "*from now on*: \"say that again slower\" is a re-read, so just say it again "
+        "slower — but \"you talk too fast\" is a setting, so change it with set_voice. "
+        "set_brain switches which model answers this conversation. Changing what a "
+        "keyword *means* is a different thing entirely — install-wide and shared with "
+        "every other app — so it needs remap_keyword and the user's explicit say-so. "
+        "Change none of it unprompted, don't offer, and don't announce it at length "
+        "afterwards."
+    )
+
+
 def compose_system_prompt(
     *,
     runtime_context: str | None = None,
@@ -131,6 +162,7 @@ def compose_system_prompt(
     client_tool_names: Sequence[str] = (),
     notes_block: str | None = None,
     ecosystem_block: str | None = None,
+    settings_description: str | None = None,
 ) -> str:
     """The full system prompt for one turn.
 
@@ -155,6 +187,11 @@ def compose_system_prompt(
     device = _device_block(client_tool_names)
     if device:
         parts.append(device)
+    # Beside the device block: both describe *this connection* rather than Amber in
+    # general, and both are interpolated from live state rather than described.
+    knobs = _settings_block(settings_description)
+    if knobs:
+        parts.append(knobs)
     if notes_block:
         parts.append(notes_block)
     if runtime_context:

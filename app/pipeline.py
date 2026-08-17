@@ -36,6 +36,7 @@ from app import protocol, signals
 from app.brain import record_spend as brain_record_spend, think
 from app.config import get_settings
 from app.ecosystem import build_ecosystem_block
+from app.knobs import enabled as knobs_enabled
 from app.memory import build_memory_view, build_notes_block, get_store, remember
 from app.persona import compose_system_prompt
 from app.responder import respond
@@ -43,6 +44,7 @@ from app.runtime_context import build_runtime_context
 from app.sentence_splitter import SentenceSplitter
 from app.session import Conversation
 from app.stt import transcribe
+from app.timings import TurnTimings, step_spans
 from app.tts import synthesize
 from app.turn_signals import TurnSignals
 from app.voice import VoiceSettings
@@ -50,6 +52,7 @@ from app.voice import VoiceSettings
 if TYPE_CHECKING:
     from app.client_tools import ClientTools
     from app.confirm import Confirmations
+    from app.knobs import Knobs
 
 logger = logging.getLogger(__name__)
 
@@ -75,6 +78,7 @@ async def run_turn(
     voice: VoiceSettings | None = None,
     model: str | None = None,
     confirmations: "Confirmations | None" = None,
+    knobs: "Knobs | None" = None,
 ) -> int:
     """Process one user turn and stream the spoken reply back.
 
@@ -106,12 +110,16 @@ async def run_turn(
     conversation = conversation if conversation is not None else Conversation()
     # Pinned for the whole turn — see the docstring.
     voice = voice if voice is not None else VoiceSettings.from_settings(settings)
+    # Where this turn's seconds go. See `app.timings` — the tool portion is
+    # deliberately absent, because the `activity` frames already carry it.
+    timings = TurnTimings()
 
     # 1. Transcribe — or take the client's typed text verbatim, skipping STT.
     if text is not None:
         transcript_text = text
     elif settings.feature_stt:
-        transcript_text = await transcribe(audio)
+        with timings.stt():
+            transcript_text = await transcribe(audio)
     else:
         transcript_text = ""
         logger.info("STT disabled (AMBER_FEATURE_STT=false); using canned greeting")
@@ -131,7 +139,7 @@ async def run_turn(
             # Nothing heard (silence, or STT disabled) — reprompt without spending
             # an LLM call or feeding the brain an empty user turn.
             spoken = await _speak_stream(
-                _canned(_DIDNT_CATCH), send_json, send_bytes, voice
+                _canned(_DIDNT_CATCH), send_json, send_bytes, voice, timings
             )
         else:
             spoken, reply, awaiting, used_fact_ids, stats = await _think_and_speak(
@@ -144,6 +152,8 @@ async def run_turn(
                 voice=voice,
                 model=model,
                 confirmations=confirmations,
+                knobs=knobs,
+                timings=timings,
                 # A typed turn reads on a screen; a spoken one is heard. Same words,
                 # different register — see `app.persona`.
                 modality="text" if text is not None else "voice",
@@ -151,6 +161,7 @@ async def run_turn(
     finally:
         await send_json(protocol.thinking(False))
 
+    stats["timings"] = timings.as_dict()
     await send_json(
         protocol.turn_complete(spoken, awaiting_response=awaiting, **stats)
     )
@@ -162,7 +173,10 @@ async def run_turn(
         signals.KIND_TURN,
         name="text" if text is not None else "voice",
         ok=bool(reply),
-        latency_ms=None,
+        # Recorded at last. This was hard-coded ``None``, so no turn had ever
+        # logged its own duration — the one telemetry row that represents a
+        # user-visible turn carried no latency at all.
+        latency_ms=int(timings.total_s * 1000),
         detail=f"sentences={spoken} facts={len(used_fact_ids)}",
         session_id=conversation_id,
     )
@@ -205,6 +219,8 @@ async def _think_and_speak(
     voice: VoiceSettings | None = None,
     model: str | None = None,
     confirmations: "Confirmations | None" = None,
+    knobs: "Knobs | None" = None,
+    timings: TurnTimings | None = None,
 ) -> tuple[int, str, bool, list[int]]:
     """Record the user turn, stream a reply, and record what was spoken.
 
@@ -217,6 +233,7 @@ async def _think_and_speak(
     model called ``expect_reply``); the canned ``respond`` fallback never sets it.
     """
     settings = get_settings()
+    timings = timings if timings is not None else TurnTimings()
     signals = TurnSignals()
     used_fact_ids: list[int] = []
     # Collects what each model call actually cost. Passed to the runner and read
@@ -255,6 +272,14 @@ async def _think_and_speak(
             # actually reach. Rebuilt per turn (it's only string joins) so a config
             # change lands without a restart. None unless the flag is on.
             ecosystem_block=build_ecosystem_block(),
+            # The voice and model actually in effect, so "talk slower" knows which
+            # way that is. None when Amber has no tools to change them with, since
+            # describing a setting she can't touch is just tokens.
+            settings_description=(
+                knobs.describe()
+                if knobs is not None and knobs_enabled(settings)
+                else None
+            ),
         )
         tokens = think(
             conversation.messages,
@@ -271,6 +296,9 @@ async def _think_and_speak(
             # socket rather than passed as a sink, because the *answer* arrives on the
             # receive loop and has to find the call that is blocked on it.
             confirmations=confirmations,
+            # Amber's own settings, so "talk slower" lands on the value the Settings
+            # page writes. Read once per turn upstream, so a change lands on the next.
+            knobs=knobs,
             # Collects each step's model, tokens, cost and timings — recorded below,
             # after the reply is out. See `brain.record_spend`.
             state=state,
@@ -286,10 +314,12 @@ async def _think_and_speak(
                 tokens,
                 spoken_text,
                 send_json if settings.feature_text_stream else None,
+                timings,
             ),
             send_json,
             send_bytes,
             voice,
+            timings,
         )
     finally:
         reply = "".join(spoken_text).strip()
@@ -299,7 +329,13 @@ async def _think_and_speak(
         # a partial reply, for the same reason: an interrupted turn still happened and
         # still cost money. `record_spend` never raises.
         cost = await brain_record_spend(state, conversation_id=conversation_id)
-    return spoken, reply, signals.awaiting_response, used_fact_ids, _stats(state, cost)
+    return (
+        spoken,
+        reply,
+        signals.awaiting_response,
+        used_fact_ids,
+        _stats(state, cost),
+    )
 
 
 def _stats(state: RunState, cost: float) -> dict:
@@ -311,7 +347,7 @@ def _stats(state: RunState, cost: float) -> dict:
     """
     if not state.steps:
         return {}
-    return {
+    out = {
         "steps": len(state.steps),
         "tokens_in": sum(step.tokens_in for step in state.steps),
         "tokens_out": sum(step.tokens_out for step in state.steps),
@@ -320,6 +356,12 @@ def _stats(state: RunState, cost: float) -> dict:
         # resolved to at the start — the table can be re-pointed between turns.
         "model": state.steps[-1].model,
     }
+    # When each model call ran. Already on every `Step` and discarded until now; it is
+    # what turns "3 steps" into a picture of where the time went.
+    spans = step_spans(state)
+    if spans:
+        out["step_spans"] = spans
+    return out
 
 
 async def _remember_safe(
@@ -354,6 +396,7 @@ async def _capture(
     tokens: AsyncIterator[str],
     sink: list[str],
     send_json: SendJson | None = None,
+    timings: TurnTimings | None = None,
 ) -> AsyncIterator[str]:
     """Pass tokens through unchanged while accumulating them for history.
 
@@ -370,6 +413,11 @@ async def _capture(
     """
     async for chunk in tokens:
         sink.append(chunk)
+        if chunk and timings is not None:
+            # The first *text*, not the first event — a turn that runs three tools
+            # before saying anything waited that long to start talking, and that is
+            # the number worth showing.
+            timings.first_token()
         if send_json is not None and chunk:
             await send_json(protocol.delta(chunk))
         yield chunk
@@ -385,6 +433,7 @@ async def _speak_stream(
     send_json: SendJson,
     send_bytes: SendBytes,
     voice: VoiceSettings | None = None,
+    timings: TurnTimings | None = None,
 ) -> int:
     """Run a token stream through the splitter, synthesizing & sending each sentence."""
     voice = voice if voice is not None else VoiceSettings.from_settings()
@@ -393,7 +442,14 @@ async def _speak_stream(
 
     async def emit(sentence: str) -> None:
         nonlocal index
-        audio_bytes = await synthesize(sentence, voice)
+        # Summed across sentences rather than measured as a span: synthesis is
+        # interleaved with generation, so the wall-clock window would overlap the
+        # model's and double-count. This is time spent *in* TTS.
+        if timings is not None:
+            with timings.tts():
+                audio_bytes = await synthesize(sentence, voice)
+        else:
+            audio_bytes = await synthesize(sentence, voice)
         # The container comes from the voice actually used, not from config — a
         # client that asked for wav must not be told the bytes are mp3.
         await send_json(protocol.audio_chunk(index, sentence, voice.audio_format))

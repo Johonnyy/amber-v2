@@ -312,6 +312,38 @@ def _m8_reminder_fired(conn: sqlite3.Connection) -> None:
 
 
 # Ordered; index + 1 is the schema version each one produces. Append only.
+def _m9_eval_cases(conn: sqlite3.Connection) -> None:
+    """Turns that went wrong, kept as regression cases.
+
+    CLAUDE.md has wanted 10-20 hand-written query -> expected-tool-call cases since the
+    beginning and none has ever been written, for a simple reason: the moment you would
+    write one is the moment a turn goes wrong, and there was nowhere to put it. This is
+    that place.
+
+    The case carries the *query* and the expected tool rather than a pointer into
+    `conversations`, deliberately. That table has four columns, no session id, and pairs
+    user with assistant **positionally** — one interrupted turn writing an orphan row
+    shifts every pair after it. A case that referenced a row could silently come to mean
+    a different conversation. This is self-contained and cannot rot that way.
+    """
+    conn.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS eval_cases (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            query       TEXT    NOT NULL,           -- what the user said
+            expect_tool TEXT,                       -- what should have been called
+            got_tool    TEXT,                       -- what actually was, for context
+            note        TEXT,                       -- why this was wrong
+            reply       TEXT,
+            created_at  TEXT    NOT NULL,
+            status      TEXT    NOT NULL DEFAULT 'active'  -- 'active' | 'archived'
+        );
+        CREATE INDEX IF NOT EXISTS idx_eval_cases_status
+            ON eval_cases (status, created_at);
+        """
+    )
+
+
 _MIGRATIONS: tuple[Callable[[sqlite3.Connection], None], ...] = (
     _m1_baseline,
     _m2_fact_metadata,
@@ -321,6 +353,7 @@ _MIGRATIONS: tuple[Callable[[sqlite3.Connection], None], ...] = (
     _m6_model_keywords,
     _m7_push_outbox,
     _m8_reminder_fired,
+    _m9_eval_cases,
 )
 
 # The FTS migration is allowed to fail (old SQLite); the rest are not.
@@ -338,6 +371,28 @@ def _tier_rank(tier: str | None) -> int:
 def _now() -> str:
     """Current UTC time as an ISO-8601 string (lexically sortable)."""
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+#: `app.signals.KIND_TOOL_CALL`, spelled out rather than imported — `app.signals`
+#: imports *this* module, so reaching back for the constant would cycle. A test asserts
+#: the two agree.
+_KIND_TOOL_CALL = "tool_call"
+
+
+def _percentile(values: list[int], pct: float) -> int:
+    """Nearest-rank percentile.
+
+    Copied deliberately from `agent_mcp.usage_log._percentile` rather than imported:
+    that module owns the MCP usage table and importing it here to read Amber's own
+    telemetry would tie two tenants of this database together for one arithmetic
+    helper. The two must agree about what p95 means, so the implementation is
+    identical and this comment is the link between them.
+    """
+    if not values:
+        return 0
+    ordered = sorted(values)
+    index = max(0, min(len(ordered) - 1, round(pct / 100 * len(ordered) + 0.5) - 1))
+    return ordered[index]
 
 
 def _parse_iso(value: str | None) -> datetime | None:
@@ -1087,6 +1142,58 @@ class MemoryStore:
             self._conn.commit()
             return cur.rowcount > 0
 
+    # --- how the tools are actually doing (see `app.review`) ---
+
+    def tool_reliability(self, since_iso: str, limit: int = 40) -> list[dict]:
+        """Per-tool success rate and latency percentiles since ``since_iso``.
+
+        `event_summary` groups by ``(kind, name, ok)`` and reports AVG and MAX, which is
+        the shape one LLM prompt wanted and the wrong shape for a person: an average
+        hides the tail, and the tail is what a degraded tool feels like. This pivots to
+        one row per tool with p50/p95.
+
+        Percentiles are **nearest-rank**, matching `agent_mcp.usage_log._percentile`
+        exactly — the two tables are read side by side and disagreeing about what p95
+        means would be worse than not reporting it. Computed in Python because SQLite
+        has no percentile function without an extension, and the row counts here are one
+        person's tool calls.
+        """
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT name, ok, latency_ms FROM turn_events "
+                "WHERE kind = ? AND created_at >= ? AND name IS NOT NULL",
+                (_KIND_TOOL_CALL, since_iso),
+            ).fetchall()
+
+        by_name: dict[str, dict] = {}
+        for row in rows:
+            entry = by_name.setdefault(
+                row["name"], {"name": row["name"], "calls": 0, "errors": 0, "_lat": []}
+            )
+            entry["calls"] += 1
+            # ``ok`` is nullable, and NULL is "not known" rather than "failed" — only a
+            # recorded 0 counts against a tool.
+            if row["ok"] == 0:
+                entry["errors"] += 1
+            if row["latency_ms"] is not None:
+                entry["_lat"].append(int(row["latency_ms"]))
+
+        out: list[dict] = []
+        for entry in by_name.values():
+            latencies = entry.pop("_lat")
+            entry["ok_rate"] = round(
+                (entry["calls"] - entry["errors"]) / entry["calls"], 3
+            )
+            entry["p50_ms"] = _percentile(latencies, 50)
+            entry["p95_ms"] = _percentile(latencies, 95)
+            entry["max_ms"] = max(latencies) if latencies else 0
+            out.append(entry)
+
+        # Worst first: a board is for finding the thing that's broken, and sorting by
+        # call count would bury a tool that fails every time it is used.
+        out.sort(key=lambda e: (e["ok_rate"], -e["calls"]))
+        return out[: max(1, limit)]
+
     def complete_reminder(self, reminder_id: int) -> bool:
         """Mark a reminder done. Returns ``True`` if a pending one was updated."""
         with self._lock:
@@ -1096,6 +1203,64 @@ class MemoryStore:
             )
             self._conn.commit()
             return cur.rowcount > 0
+
+    def lineage(self, fact_id: int, limit: int = 12) -> list[dict]:
+        """A fact's revision history, oldest first.
+
+        `supersede_fact` has always written `superseded_by`, pointing each retired row
+        forward at its replacement — and nothing has ever read it. So every correction
+        the user has made ("no, I moved to Denver") built an audit trail that no UI, no
+        tool and no MCP resource could see.
+
+        Walks backwards to the oldest ancestor first, then forwards through the chain,
+        so the caller gets the whole story regardless of which link it asked about.
+        Bounded and cycle-guarded: `update_fact(status='active')` can restore a
+        superseded row without clearing its forward pointer, so a chain is not
+        guaranteed acyclic just because it was written by well-behaved code.
+        """
+        seen: set[int] = set()
+
+        # Back to the root: whichever row points *at* this one, repeatedly.
+        current = fact_id
+        with self._lock:
+            for _ in range(limit):
+                row = self._conn.execute(
+                    "SELECT id FROM facts WHERE superseded_by = ? LIMIT 1", (current,)
+                ).fetchone()
+                if row is None or row["id"] in seen:
+                    break
+                seen.add(row["id"])
+                current = row["id"]
+
+        # Then forwards, collecting the whole chain.
+        chain: list[dict] = []
+        seen.clear()
+        while current is not None and current not in seen and len(chain) < limit:
+            seen.add(current)
+            row = self.get_fact(current)
+            if row is None:
+                break
+            chain.append(row)
+            current = row.get("superseded_by")
+        return chain
+
+    def forgotten_facts(self, limit: int = 50) -> list[dict]:
+        """What Amber has stopped believing, newest first.
+
+        Deliberately includes both `forgotten` and `superseded`: from a person's point
+        of view "things you no longer think" is one list. What it cannot tell you is
+        *why* a fact was forgotten — decay, an explicit request and a consolidation
+        merge all write the identical row, and separating them needs a column that does
+        not exist.
+        """
+        with self._lock:
+            rows = self._conn.execute(
+                f"SELECT {_FACT_COLUMNS} FROM facts "
+                "WHERE status IN ('forgotten', 'superseded') "
+                "ORDER BY updated_at DESC, id DESC LIMIT ?",
+                (max(1, limit),),
+            ).fetchall()
+        return [dict(r) for r in rows]
 
     # --- the push outbox (see `app.push`) ---
 
@@ -1277,11 +1442,92 @@ class MemoryStore:
             return []
         with self._lock:
             rows = self._conn.execute(
-                "SELECT id, created_at, period_start, period_end, kind, note "
+                # `dismissed` is selected as well as filtered on now: it was neither,
+                # so a note retired by hand would have stayed invisible to any caller.
+                "SELECT id, created_at, period_start, period_end, kind, note, dismissed "
                 "FROM reflections WHERE dismissed = 0 ORDER BY id DESC LIMIT ?",
                 (limit,),
             ).fetchall()
         return [dict(r) for r in rows]
+
+    def dismiss_reflection(self, reflection_id: int) -> bool:
+        """Retire one note. Returns ``True`` if it was still showing.
+
+        The writer this column never had. `dismissed` has existed since the reflections
+        table was created and nothing has ever set it — which is why the loop that
+        writes self-review notes has, until now, been unable to take feedback of any
+        kind. Note `recent_reflections` also had to start *selecting* the column, or a
+        dismissal would be invisible even once written.
+        """
+        with self._lock:
+            cur = self._conn.execute(
+                "UPDATE reflections SET dismissed = 1 WHERE id = ? AND dismissed = 0",
+                (reflection_id,),
+            )
+            self._conn.commit()
+            return cur.rowcount > 0
+
+    def get_reflection(self, reflection_id: int) -> dict | None:
+        """One note by id, dismissed or not — needed to promote it into a fact."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT id, created_at, period_start, period_end, kind, note, dismissed "
+                "FROM reflections WHERE id = ?",
+                (reflection_id,),
+            ).fetchone()
+        return dict(row) if row else None
+
+    # --- eval cases (see `app.evals`) ---
+
+    def add_eval_case(
+        self,
+        query: str,
+        *,
+        expect_tool: str | None = None,
+        got_tool: str | None = None,
+        note: str | None = None,
+        reply: str | None = None,
+    ) -> int | None:
+        """Save one turn that went wrong as a regression case."""
+        query = (query or "").strip()
+        if not query:
+            return None
+        with self._lock:
+            cur = self._conn.execute(
+                "INSERT INTO eval_cases "
+                "(query, expect_tool, got_tool, note, reply, created_at, status) "
+                "VALUES (?, ?, ?, ?, ?, ?, 'active')",
+                (query, expect_tool, got_tool, note, reply, _now()),
+            )
+            self._conn.commit()
+            return int(cur.lastrowid)
+
+    def eval_cases(self, limit: int = 100, *, status: str | None = "active") -> list[dict]:
+        """Saved cases, newest first."""
+        sql = (
+            "SELECT id, query, expect_tool, got_tool, note, reply, created_at, status "
+            "FROM eval_cases"
+        )
+        params: list = []
+        if status:
+            sql += " WHERE status = ?"
+            params.append(status)
+        sql += " ORDER BY id DESC LIMIT ?"
+        params.append(max(1, limit))
+        with self._lock:
+            rows = self._conn.execute(sql, params).fetchall()
+        return [dict(r) for r in rows]
+
+    def archive_eval_case(self, case_id: int) -> bool:
+        """Retire a case without losing it — the same soft-delete posture as facts."""
+        with self._lock:
+            cur = self._conn.execute(
+                "UPDATE eval_cases SET status = 'archived' "
+                "WHERE id = ? AND status = 'active'",
+                (case_id,),
+            )
+            self._conn.commit()
+            return cur.rowcount > 0
 
     def last_reflection_at(self) -> str | None:
         """When the maintenance pass last wrote a note, for the next run's window."""

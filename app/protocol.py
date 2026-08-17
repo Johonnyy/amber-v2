@@ -191,6 +191,35 @@ Marking a tool would have made it permanently uncallable rather than safely gate
   Unlike ``push``, this one does arrive mid-turn, and that is safe for the same reason
   ``tool_call`` is: it is emitted from the task already driving the turn, which by
   construction is not between an ``audio_chunk`` and its bytes while it waits on a tool.
+
+**How Amber is doing** adds a last trio, shaped exactly like ``memory_query`` /
+``memory`` / ``memory_action`` because it is the same kind of thing: a browse, a
+response, and a couple of verbs on what came back.
+
+  * ``review_query`` (client -> server) — ``{topic, since?, limit?}``.
+  * ``review`` (server -> client) — ``{topic, items, ack?}``.
+  * ``review_action`` (client -> server) — ``{topic, action, id}``.
+
+  ``topic`` is one of ``tools`` (per-tool success rate and p50/p95 latency),
+  ``reflections`` (what the maintenance pass noticed about how conversations go, with
+  ``promote`` and ``dismiss``) or ``evals`` (turns saved as regression cases, with
+  ``archive``).
+
+  Every one of these was already being recorded and shown to nobody: tool latency fed a
+  single LLM prompt, the reflections table needed an MCP key to read, and
+  ``reflections.dismissed`` had no writer at all — the self-improvement loop ran
+  unattended and reported to no one.
+
+  **Promoting a reflection is the interesting verb**, and it is what makes
+  ``AMBER_FEATURE_SELF_NOTES`` safe to leave off: the note becomes an ordinary durable
+  fact because *a person chose to keep it*, so you get the value of self-observation
+  without the model editing its own instructions.
+
+``eval_capture`` (client -> server) saves the turn you are looking at as a regression
+case — the utterance, what should have been called, what was. It carries the whole case
+rather than a pointer into the exchange log, because that table has no session id and
+pairs user with assistant positionally, so a reference into it could quietly come to
+mean a different conversation. Answered with a ``review`` frame for the ``evals`` topic.
 """
 
 from __future__ import annotations
@@ -208,6 +237,9 @@ MEMORY_ACTION = "memory_action"  # forget / restore / correct one remembered fac
 MEMORY_QUERY = "memory_query"  # browse or search everything Amber remembers
 PUSH_ACK = "push_ack"  # acknowledge (and optionally act on) a delivered push
 CONFIRM_RESPONSE = "confirm_response"  # approve or deny a confirm_request
+REVIEW_QUERY = "review_query"  # how is Amber doing? tools / reflections / evals
+REVIEW_ACTION = "review_action"  # act on one reviewed item
+EVAL_CAPTURE = "eval_capture"  # save this turn as a regression case
 
 # --- server -> client message types ---
 READY = "ready"  # handshake accepted; server is listening
@@ -224,7 +256,13 @@ DELTA = "delta"  # raw reply text as generated, for rendering (advisory)
 STATUS = "status"  # what this install can reach and what it has spent (advisory)
 PUSH = "push"  # Amber, unprompted: a reminder fired, a note, something finished
 CONFIRM_REQUEST = "confirm_request"  # may I run this? blocks until answered
+REVIEW = "review"  # answers a review_query (advisory)
 ERROR = "error"  # something went wrong this turn
+
+# --- ``review.topic``: which "how is Amber doing" question this answers ---
+REVIEW_TOOLS = "tools"  # per-tool success rate and latency
+REVIEW_REFLECTIONS = "reflections"  # what the maintenance pass noticed about itself
+REVIEW_EVALS = "evals"  # saved turns that went wrong, kept as regression cases
 
 # --- ``push.kind``: what sort of unprompted thing this is ---
 # A client routes on this rather than parsing ``text``, so a reminder can ring and a
@@ -315,6 +353,14 @@ def turn_complete(
     # an install with cost tracking off still send the bare two-key frame. This is
     # newly *possible* rather than newly collected — the numbers always existed and
     # `AgentRunner.stream` discarded them.
+    #
+    # And where the turn's *time* went: ``timings`` (``total_ms`` always, plus
+    # ``stt_ms`` / ``first_token_ms`` / ``tts_ms`` when that turn did those things)
+    # and ``step_spans`` (each model call's start and end). Deliberately no
+    # ``tools_ms`` — every tool call already arrives as an ``activity`` pair carrying
+    # its own ``ms``, and measuring it a second time here would be two sources for
+    # one number, with two chances to disagree. A client draws the waterfall from
+    # both: the server's spans, and the tool calls it already has.
     frame.update(stats)
     return frame
 
@@ -564,6 +610,31 @@ def confirm_request(
     }
     if tool_input is not None:
         frame["input"] = tool_input
+    return frame
+
+
+def review(
+    topic: str, items: list[dict[str, Any]], *, ack: dict[str, Any] | None = None, **extra: Any
+) -> dict[str, Any]:
+    """How Amber is doing, by topic. Answers a ``review_query``.
+
+    One frame for three panels rather than three frames, and the shape is deliberately
+    the trio `memory_query` / `memory` / `memory_action` established: a browse, a
+    response, and a small set of actions on what came back. Tool reliability, the
+    maintenance pass's self-review notes and saved eval cases are all the same kind of
+    thing — a read-only look at how the system is behaving, with one or two verbs.
+
+    All of this is data Amber has always had and never showed anyone.
+    `store.event_summary` fed exactly one LLM prompt; the reflections table was
+    reachable only with an MCP key; eval cases had nowhere to live at all.
+
+    ``ack`` settles a ``review_action`` the same way `memory`'s does, so a panel that
+    clicked something knows whether it took.
+    """
+    frame: dict[str, Any] = {"type": REVIEW, "topic": topic, "items": list(items)}
+    if ack is not None:
+        frame["ack"] = dict(ack)
+    frame.update(extra)
     return frame
 
 

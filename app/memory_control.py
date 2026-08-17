@@ -91,6 +91,56 @@ async def handle_action(payload: dict[str, Any], settings: Settings) -> dict[str
     )
 
 
+async def handle_lineage(payload: dict[str, Any], settings: Settings) -> dict[str, Any]:
+    """One fact's revision history, oldest first.
+
+    `supersede_fact` has written `superseded_by` on every correction since tiering
+    landed, and nothing has ever read it — so "no, I moved to Denver" built an audit
+    trail that no surface could show. This is that chain: *Lives in Boston → Lives in
+    Denver*, with when each replacement happened.
+
+    Rides the existing `memory` frame under a new `scope`, which the frame has always
+    carried, so a client that doesn't know the scope simply sees a fact list.
+    """
+    fact_id = payload.get("id")
+    if not isinstance(fact_id, int):
+        return protocol.memory([], [], scope="lineage")
+
+    rows = await asyncio.to_thread(get_store().lineage, fact_id)
+    facts = [wire_fact(row) for row in rows]
+    return protocol.memory(
+        [f["content"] for f in facts], facts, scope="lineage", total=len(facts)
+    )
+
+
+async def handle_archive(payload: dict[str, Any], settings: Settings) -> dict[str, Any]:
+    """What Amber has stopped believing — forgotten and superseded together.
+
+    From a person's point of view that is one list. What it cannot say is *why* a fact
+    left: decay, an explicit "forget that" and a consolidation merge all write the same
+    row, and telling them apart would need a column that does not exist.
+    """
+    limit = payload.get("limit")
+    if not isinstance(limit, int) or limit <= 0:
+        limit = DEFAULT_BROWSE_LIMIT
+    store = get_store()
+    rows = await asyncio.to_thread(
+        store.forgotten_facts, min(limit, MAX_BROWSE_LIMIT)
+    )
+    facts = [wire_fact(row) for row in rows]
+    # The real archive size, not the page size — `total` means "what this is a slice
+    # of", and answering it with `len(facts)` would tell a truncated list it was whole.
+    def _archive_total() -> int:
+        return store.fact_count(status="forgotten") + store.fact_count(
+            status="superseded"
+        )
+
+    total = await asyncio.to_thread(_archive_total)
+    return protocol.memory(
+        [f["content"] for f in facts], facts, scope="archive", total=total
+    )
+
+
 async def handle_query(payload: dict[str, Any], settings: Settings) -> dict[str, Any]:
     """Answer a `memory_query`: everything Amber knows, or a search of it.
 
@@ -99,6 +149,15 @@ async def handle_query(payload: dict[str, Any], settings: Settings) -> dict[str,
     conflating them would mean a memory could only be deleted on a turn that happened
     to retrieve it.
     """
+    # Two extra scopes ride this same frame: a fact's revision history, and the
+    # archive of what she no longer believes. Both read columns that have always been
+    # written and never read.
+    scope = payload.get("scope")
+    if scope == "lineage":
+        return await handle_lineage(payload, settings)
+    if scope == "archive":
+        return await handle_archive(payload, settings)
+
     raw = payload.get("q")
     query = raw.strip() if isinstance(raw, str) and raw.strip() else None
     limit = payload.get("limit")

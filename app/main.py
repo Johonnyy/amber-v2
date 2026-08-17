@@ -39,11 +39,12 @@ from fastapi import (
     status,
 )
 
-from app import memory_control, model_sync, models, peers, protocol, push, signals
+from app import memory_control, model_sync, models, peers, protocol, push, review, signals
 # Aliased: `fastapi.status` is already imported above for the WS close codes, and
 # these two would otherwise be one name meaning two things in the same module.
 from app import status as status_report
 from app.config import Settings, get_settings
+from app.knobs import Knobs
 from app.pipeline import run_turn
 from app.session import Session, SessionManager, get_session_manager
 from app.voice import options as voice_options
@@ -217,12 +218,14 @@ async def submit_push(request: Request) -> dict[str, Any]:
     return {"id": push_id, "status": "queued", "listeners": push.get_deliverer().live()}
 
 
-#: Kinds an external caller may claim. ``reminder`` is deliberately absent: those are
-#: Amber's own, minted by the scheduler against a real row, and letting a peer forge one
-#: would put a reminder in front of the user that no reminder exists behind.
-_PUSH_KINDS = frozenset(
-    {protocol.PUSH_NOTICE, protocol.PUSH_PEER_EVENT, protocol.PUSH_REFLECTION}
-)
+#: Kinds an external caller may claim.
+#:
+#: ``reminder`` and ``reflection`` are deliberately absent. Both are Amber's own, minted
+#: against a real row — the scheduler mints one, the maintenance pass the other — and a
+#: push of either kind carries a ``ref`` that an acknowledgment *acts on*. So letting a
+#: peer forge one would let it put a reminder in front of the user with nothing behind
+#: it, or hand back a ``ref`` whose dismissal retires an unrelated note.
+_PUSH_KINDS = frozenset({protocol.PUSH_NOTICE, protocol.PUSH_PEER_EVENT})
 
 
 def _authorized(websocket: WebSocket, settings: Settings) -> bool:
@@ -552,6 +555,36 @@ async def _handle_control(
         # The human's answer to a blocked tool call. Unknown or late ids are dropped,
         # like any other correlation-keyed result.
         session.confirmations.resolve(payload.get("id"), bool(payload.get("approved")))
+    elif kind in (protocol.REVIEW_QUERY, protocol.REVIEW_ACTION):
+        # How Amber is doing — tool reliability, her own self-review notes, and the
+        # eval cases saved from turns that went wrong. All of it data she has always
+        # had and never showed anyone.
+        if not review.enabled(settings):
+            logger.debug("[%s] Ignoring %s (review off)", session.id, kind)
+            return
+        handler = (
+            review.handle_query
+            if kind == protocol.REVIEW_QUERY
+            else review.handle_action
+        )
+        try:
+            await send_json(await handler(payload, settings))
+        except Exception:  # noqa: BLE001 — a panel is never worth the socket
+            logger.exception("[%s] %s failed", session.id, kind)
+    elif kind == protocol.EVAL_CAPTURE:
+        # "That turn was wrong" — saved as a regression case while you are still
+        # looking at it, which is the only moment anyone would ever write one.
+        if not (review.enabled(settings) and settings.feature_evals):
+            logger.debug("[%s] Ignoring eval_capture (evals off)", session.id)
+            return
+        try:
+            case_id = await review.capture_eval(payload)
+            logger.info("[%s] Eval case saved: #%s", session.id, case_id)
+            await send_json(
+                await review.handle_query({"topic": protocol.REVIEW_EVALS}, settings)
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception("[%s] eval_capture failed", session.id)
     elif kind in (protocol.MEMORY_ACTION, protocol.MEMORY_QUERY):
         # Curating memory from the UI, landing on the same store functions Amber's
         # own `forget_fact` / `correct_fact` tools call. Two ways in, one code path —
@@ -623,6 +656,10 @@ async def _guarded_turn(
             model=session.model_keyword,
             # Bound to this socket, so a gated tool can ask the person actually here.
             confirmations=session.confirmations,
+            # Amber's own settings, so asking works as well as clicking. Built per
+            # turn over the *session*, so a change it makes lands on the next turn —
+            # the `voice` and `model` values above were already read into locals.
+            knobs=Knobs(session, send_json),
         )
     except asyncio.CancelledError:
         raise  # interrupt/barge-in — expected, let it unwind

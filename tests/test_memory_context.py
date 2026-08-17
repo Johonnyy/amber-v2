@@ -217,10 +217,16 @@ async def test_the_block_carries_ids_so_facts_can_be_acted_on(store):
     assert fact["source"] == "extracted"
     assert "last_used_at" in fact
     assert "category" in fact
-    # Never the audit columns: this view is of active facts, so `status` is a
-    # constant here and `superseded_by` only means anything in a history view.
-    assert "status" not in fact
-    assert "superseded_by" not in fact
+    # The audit columns are here now. They used to be left out on the grounds that
+    # this view is of *active* facts, so `status` was a constant and `superseded_by`
+    # only meant something in a history view — but the history view turned out to be
+    # the point: every correction wrote a `superseded_by` pointer that nothing could
+    # read, so a fact's revision history existed on disk and was visible nowhere.
+    assert fact["status"] == "active"
+    assert fact["superseded_by"] is None
+    # And `created_at`, which is the only clock a *never-used* fact has — which is
+    # exactly the fact a decay countdown is about.
+    assert "created_at" in fact
 
 
 async def test_open_tasks_are_capped(store):

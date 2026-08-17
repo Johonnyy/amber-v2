@@ -121,11 +121,13 @@ Every client speaks this; see [app/protocol.py](app/protocol.py) for exact shape
   Amber is speaking also barges in (cancels the current turn).
 - **Send** control frames to change things: `set_voice`, `set_model`,
   `register_tools`, `tool_result`, `memory_action`, `memory_query`, `push_ack`,
-  `confirm_response`.
+  `confirm_response`, `review_query`, `review_action`, `eval_capture`.
 - **Receive** JSON control frames interleaved with binary audio frames. Each
   `audio_chunk` is immediately followed by the binary audio for that sentence.
   - Per turn: `transcript`, `thinking`, `memory`, `activity`, `delta`,
-    `audio_chunk`, `turn_complete`, `error`.
+    `audio_chunk`, `turn_complete` (which carries where the turn's time went), `error`.
+  - On request: `review` — per-tool reliability, Amber's own self-review notes, and
+    saved eval cases.
   - On connect: `ready`, then `voice`, `model` and `status` — the server says what is
     true rather than the client shipping a copy that drifts.
   - `tool_call` asks the client to run one of its own declared tools.

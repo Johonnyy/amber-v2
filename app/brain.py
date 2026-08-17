@@ -76,6 +76,7 @@ from agent_mcp.registry import load_static_peers
 from app import activity as activity_stream
 from app import confirm
 from app import peers as peer_discovery
+from app.knobs import enabled as knobs_enabled
 from app.config import Settings, get_settings
 from app.models import resolve as resolve_model
 from app.persona import SYSTEM_PROMPT
@@ -85,6 +86,7 @@ if TYPE_CHECKING:
     from app.activity import SendJson
     from app.client_tools import ClientTools
     from app.confirm import Confirmations
+    from app.knobs import Knobs
     from app.turn_signals import TurnSignals
 
 logger = logging.getLogger(__name__)
@@ -101,6 +103,130 @@ _EXPECT_REPLY_DESCRIPTION = (
     "most turns just end. Speak your question as normal text; this only keeps "
     "the mic open for their answer."
 )
+
+
+# Amber changing her own settings when asked (design principle 3). Three tools with
+# deliberately different postures — see `app.knobs` for why the third is gated.
+SET_VOICE_TOOL = "set_voice"
+SET_BRAIN_TOOL = "set_brain"
+REMAP_KEYWORD_TOOL = "remap_keyword"
+
+_SET_VOICE_DESCRIPTION = (
+    "Change how you sound for the rest of this conversation. Use it when the user "
+    "asks you to talk slower or faster, to use a different voice, or to change your "
+    "delivery ('can you talk slower', 'you're too quiet', 'sound more upbeat'). "
+    "`speed` is a multiplier where 1.0 is normal — nudge it by about 0.15 for "
+    "'a bit', more for 'much'. Do NOT use it to re-read something at a different "
+    "pace for one sentence; this changes the setting from here on. Takes effect on "
+    "your next reply, so answer normally after calling it."
+)
+_SET_BRAIN_DESCRIPTION = (
+    "Switch which model answers, for this conversation only, by keyword ('fast', "
+    "'strong', 'coding', 'cheap'). Use it when the user asks for a different or "
+    "better model, or when they want speed over quality. Omit the keyword to go back "
+    "to the default. This does NOT change what a keyword means — use remap_keyword "
+    "for that."
+)
+_REMAP_KEYWORD_DESCRIPTION = (
+    "Re-point what a model keyword *means*, for this whole install and every other "
+    "app that shares the keyword table. Use it ONLY when the user explicitly says a "
+    "keyword should map to a different model ('make coding use opus from now on'). "
+    "This is persisted and shared across the ecosystem, so it is not the tool for "
+    "'use a better model for this' — that is set_brain. Omit the model to reset a "
+    "keyword to its built-in default."
+)
+
+
+def _knobs_broker(knobs: "Knobs", settings: Settings) -> LocalToolBroker | None:
+    """The tools that let Amber drive her own settings, or ``None`` if none apply.
+
+    Closures over a per-turn `Knobs`, the way `_signal_broker` closes over `TurnSignals`
+    — the registry is process-wide and cannot be handed a connection, so this is the
+    route. Each tool is offered only when the matching client-facing control is enabled,
+    so a locked install advertises nothing rather than a tool that silently no-ops.
+
+    ``requires_confirmation`` on `remap_keyword` alone is the design point. Slowing
+    Amber down is per-connection and undone by saying so again; re-pointing a keyword is
+    written to SQLite and pushed to the sync store, so a passing remark would change what
+    `coding` means in every app in the ecosystem. Same tool surface, different posture.
+    """
+    if not (settings.feature_voice_control or settings.feature_model_control):
+        return None
+
+    broker = LocalToolBroker()
+
+    if settings.feature_voice_control:
+        broker.register(
+            SET_VOICE_TOOL,
+            _SET_VOICE_DESCRIPTION,
+            {
+                "type": "object",
+                "properties": {
+                    "speed": {
+                        "type": "number",
+                        "description": (
+                            "Speaking rate multiplier, 0.25 to 4.0. 1.0 is normal."
+                        ),
+                    },
+                    "voice": {
+                        "type": "string",
+                        "description": "Which voice to use, e.g. 'nova' or 'sage'.",
+                    },
+                    "instructions": {
+                        "type": "string",
+                        "description": (
+                            "How to deliver the words — tone, energy, accent. Only "
+                            "some TTS models support this."
+                        ),
+                    },
+                },
+            },
+            knobs.set_voice,
+        )
+
+    if settings.feature_model_control:
+        broker.register(
+            SET_BRAIN_TOOL,
+            _SET_BRAIN_DESCRIPTION,
+            {
+                "type": "object",
+                "properties": {
+                    "keyword": {
+                        "type": "string",
+                        "description": (
+                            "A model keyword such as fast, strong, coding or cheap. "
+                            "Omit to return to the server's default."
+                        ),
+                    }
+                },
+            },
+            knobs.set_brain,
+        )
+        broker.register(
+            REMAP_KEYWORD_TOOL,
+            _REMAP_KEYWORD_DESCRIPTION,
+            {
+                "type": "object",
+                "properties": {
+                    "keyword": {
+                        "type": "string",
+                        "description": "The keyword to re-point, e.g. 'coding'.",
+                    },
+                    "model": {
+                        "type": "string",
+                        "description": (
+                            "The model id it should mean, 'vendor/model'. Omit to "
+                            "reset the keyword to its built-in default."
+                        ),
+                    },
+                },
+                "required": ["keyword"],
+            },
+            knobs.remap_keyword,
+            requires_confirmation=True,
+        )
+
+    return broker
 
 
 def runtime_settings(settings: Settings | None = None) -> RuntimeSettings:
@@ -159,6 +285,7 @@ def build_broker(
     signals: "TurnSignals | None" = None,
     activity: "SendJson | None" = None,
     confirmations: "Confirmations | None" = None,
+    knobs: "Knobs | None" = None,
 ):
     """Assemble this turn's tool broker, or ``None`` when there is nothing to offer.
 
@@ -170,6 +297,10 @@ def build_broker(
     reported to the client as it happens. The wrap goes *outside* everything rather
     than around each broker individually, which is the only position that sees all
     four classes of tool — and the only one that stays correct when a broker is added.
+
+    ``knobs`` is that connection's own settings (`app.knobs`), offered as tools so
+    "can you talk slower?" lands on the same value the Settings page writes. Per
+    connection, so it cannot live in the process-wide registry.
 
     ``confirmations`` is that connection's approval channel (`app.confirm`), and its
     wrap goes *inside* the activity one. That ordering is deliberate: a call refused for
@@ -194,6 +325,14 @@ def build_broker(
 
     if settings.feature_turn_based and signals is not None:
         brokers.append(_signal_broker(signals))
+
+    # After Amber's own registry, so a colliding name there still wins, and before
+    # peers for the same reason. `knobs` is per-connection, which is exactly why these
+    # cannot live in the process-wide registry — see `app.knobs`.
+    if knobs is not None and knobs_enabled(settings):
+        knob_tools = _knobs_broker(knobs, settings)
+        if knob_tools is not None:
+            brokers.append(knob_tools)
 
     if settings.feature_tools:
         # Peers come from two places, and this used to read only one of them:
@@ -295,6 +434,7 @@ async def think(
     model: str | None = None,
     activity: "SendJson | None" = None,
     confirmations: "Confirmations | None" = None,
+    knobs: "Knobs | None" = None,
     state: RunState | None = None,
 ) -> AsyncIterator[str]:
     """Stream Amber's reply for the given conversation history.
@@ -344,6 +484,7 @@ async def think(
         signals=signals,
         activity=activity,
         confirmations=confirmations,
+        knobs=knobs,
     )
 
     keyword = model or settings.llm_tier

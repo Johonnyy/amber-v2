@@ -304,8 +304,17 @@ async def build_memory_view(
 #: (`use_count`), when it was last useful, what kind of thing it is, and whether it
 #: was told to her outright or inferred from something said in passing.
 #:
-#: `status` and `superseded_by` are left out deliberately — this view is of *active*
-#: facts, so one is a constant and the other is only meaningful in an audit trail.
+#: `status` and `superseded_by` used to be left out on the grounds that this view is of
+#: *active* facts, so one was a constant and the other only meaningful in an audit
+#: trail. Both are here now, because the audit trail turned out to be the point: every
+#: correction the user has ever made wrote a `superseded_by` pointer that nothing could
+#: read, so a fact's revision history existed on disk and was visible nowhere.
+#:
+#: `created_at` matters more than it looks. A fact's decay deadline is measured from
+#: `COALESCE(last_used_at, created_at)` — so for a fact that has *never been used*,
+#: which is precisely the one most at risk of being forgotten, `created_at` is the only
+#: clock there is. Without it a client can compute the countdown for every fact except
+#: the ones the countdown is about.
 _WIRE_FIELDS = (
     "id",
     "content",
@@ -314,7 +323,10 @@ _WIRE_FIELDS = (
     "confidence",
     "use_count",
     "last_used_at",
+    "created_at",
     "source",
+    "status",
+    "superseded_by",
 )
 
 

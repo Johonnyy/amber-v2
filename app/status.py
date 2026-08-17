@@ -136,6 +136,11 @@ def _features(settings: Settings) -> dict[str, bool]:
         ),
         # Whether to build the approval dialog. With this off, a gated tool simply runs.
         "confirmations": settings.feature_confirmations,
+        # Whether asking works as well as clicking (design principle 3).
+        "self_settings": settings.feature_self_settings,
+        # Whether the review panels have anything to talk to.
+        "review": settings.feature_review,
+        "evals": settings.feature_review and settings.feature_evals,
         "mcp_server": settings.mcp_server_enabled,
         "peer_discovery": peer_discovery.discovery_enabled(settings),
         "model_sync": model_sync.sync_enabled(settings),
@@ -143,15 +148,42 @@ def _features(settings: Settings) -> dict[str, bool]:
 
 
 async def _memory(settings: Settings) -> dict[str, Any]:
+    """How much Amber remembers, and the policy that decides what she keeps.
+
+    The **policy** half is what lets a client say "forgotten in 4 days unless used"
+    without hardcoding Amber's lifecycle rules. Every input to that countdown is already
+    on a fact row; the three thresholds are the missing half, and a client that guessed
+    them would be quietly wrong on any install that tuned them.
+    """
     if not settings.feature_memory:
         return {"facts": 0}
+    policy = {
+        "short_ttl_days": settings.fact_short_ttl_days,
+        "session_ttl_hours": settings.fact_session_ttl_hours,
+        "promote_uses": settings.fact_promote_uses,
+        # A short-tier fact used twice is immune to decay but still not durable, so a
+        # UI that showed only the promotion threshold would report a countdown for a
+        # fact that is in no danger at all.
+        "decay_immune_uses": 2,
+        # Decay and promotion happen when the maintenance pass runs, not at the instant
+        # a deadline passes — a countdown that implied otherwise would be wrong by up
+        # to one interval.
+        "pass_interval_s": settings.maintenance_interval_s,
+    }
     try:
         from app.memory.store import get_store
 
-        return {"facts": await asyncio.to_thread(get_store().fact_count)}
+        store = get_store()
+        return {
+            "facts": await asyncio.to_thread(store.fact_count),
+            # The archive has always been countable and nothing has ever asked.
+            "forgotten": await asyncio.to_thread(lambda: store.fact_count(status="forgotten")),
+            "superseded": await asyncio.to_thread(lambda: store.fact_count(status="superseded")),
+            "policy": policy,
+        }
     except Exception:  # noqa: BLE001
         logger.debug("Could not count facts for status", exc_info=True)
-        return {}
+        return {"policy": policy}
 
 
 def roles(settings: Settings) -> dict[str, str]:

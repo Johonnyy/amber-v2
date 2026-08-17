@@ -331,6 +331,27 @@ class Settings(BaseSettings):
     # this landed, and it is why the flag is worth being explicit about rather than a
     # convenience.
     feature_confirmations: bool = True
+    # When true, Amber can change her own voice and model when asked — "can you talk
+    # slower?" lowers the TTS speed rather than producing a sentence about it. This is
+    # design principle 3 made concrete: the tools drive the *same* per-connection
+    # values `set_voice` / `set_model` write, so asking and clicking cannot drift.
+    #
+    # The individual tools still follow `feature_voice_control` and
+    # `feature_model_control`, so an install that has pinned its voice offers no voice
+    # tool rather than one that silently does nothing. Off entirely reverts to the
+    # behaviour before this landed: the settings are reachable by a client frame only.
+    feature_self_settings: bool = True
+    # When true, a client can ask how Amber is doing — per-tool reliability, the
+    # self-review notes the maintenance pass writes, and saved eval cases (the
+    # ``review_query`` / ``review`` / ``review_action`` trio). All of this is data she
+    # has always recorded and never shown anyone; off simply stops answering.
+    feature_review: bool = True
+    # When true, a turn that went wrong can be saved as a regression case and replayed
+    # by ``python -m app.evals``. Cases live in `amber.db` only — nothing here ever
+    # writes to the repository, so a deploy cannot change what is committed.
+    feature_evals: bool = True
+    # How far back the tool reliability board looks, in days, when a client doesn't say.
+    review_default_days: float = 7.0
 
     # --- Push delivery (app/push.py) ---
     # How often the deliverer looks for undelivered pushes. Cheap: a SELECT against a

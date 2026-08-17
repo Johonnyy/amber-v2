@@ -332,7 +332,7 @@ async def acknowledge(payload: dict[str, Any]) -> None:
     with contextlib.suppress(Exception):
         await asyncio.to_thread(_store().mark_push_delivered, push_id)
 
-    if action != protocol.ACK_COMPLETE:
+    if action not in (protocol.ACK_COMPLETE, protocol.ACK_DISMISS):
         return
 
     try:
@@ -341,6 +341,26 @@ async def acknowledge(payload: dict[str, Any]) -> None:
         logger.debug("Could not read push %s for its ack", push_id, exc_info=True)
         return
     row = row or {}
+    ref = row.get("ref") or {}
+
+    # A dismissed reflection card retires the note itself. The ack has always carried
+    # `ref.reflection_id` and this branch was the missing half — dismissing a card did
+    # nothing, which made the maintenance pass's notes un-actionable from the one
+    # surface that showed them.
+    if row.get("kind") == protocol.PUSH_REFLECTION:
+        reflection_id = ref.get("reflection_id")
+        # Either verb retires the note — waving a self-review card away *is* the
+        # judgement. `bool` is an `int` in Python, so the same guard the reminder
+        # branch uses applies here.
+        if isinstance(reflection_id, int) and not isinstance(reflection_id, bool):
+            with contextlib.suppress(Exception):
+                await asyncio.to_thread(_store().dismiss_reflection, reflection_id)
+        return
+
+    # Everything below acts on a reminder, and only `complete` does.
+    if action != protocol.ACK_COMPLETE:
+        return
+
     # **Only a reminder push may complete a reminder.** `POST /push` already refuses
     # to let a caller claim `kind="reminder"`, but `ref` is passed through as given —
     # so without this check an authenticated peer could post an innocuous notice
@@ -348,7 +368,6 @@ async def acknowledge(payload: dict[str, Any]) -> None:
     # unrelated reminder. The kind is the part Amber controls; trust that, not the ref.
     if row.get("kind") != protocol.PUSH_REMINDER:
         return
-    ref = row.get("ref") or {}
     reminder_id = ref.get("reminder_id")
     # `bool` is an `int` in Python, and `{"reminder_id": true}` would otherwise
     # complete reminder #1.
